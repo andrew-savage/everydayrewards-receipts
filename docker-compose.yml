@@ -1,0 +1,19 @@
+services:
+  everyday-receipts:
+    build: .
+    image: everyday-receipts:local
+    container_name: everyday-receipts
+    restart: unless-stopped
+    # Files are created as this uid:gid; match what your NFS export / paperless expects.
+    user: "${PUID:-1000}:${PGID:-1000}"
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Australia/Melbourne}
+      EDR_DATA_DIR: /data
+      EDR_OUTPUT_DIR: /receipts
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${RECEIPTS_DIR:-./receipts}:/receipts
+    # Only needed if you log in with `login --listen 0.0.0.0:8765` instead of pasting the URL.
+    # ports:
+    #   - "8765:8765"

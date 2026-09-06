@@ -1,0 +1,28 @@
+[project]
+name = "everyday-receipts"
+version = "0.1.0"
+description = "Fetch Everyday Rewards (Woolworths) e-receipts as PDFs into a folder for paperless-ngx"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27,<1",
+]
+
+[project.scripts]
+everyday-receipts = "everyday_receipts.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/everyday_receipts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
