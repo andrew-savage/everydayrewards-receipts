@@ -21,7 +21,8 @@ def test_defaults(tmp_path):
     assert s.poll_interval == 21600
     assert s.full_scan is False
     assert s.token_path == tmp_path / "tokens.json"
-    assert s.auth0_domain.startswith("https://auth.everyday.com.au")
+    assert s.login_redirect_uri == "https://www.everyday.com.au/callback"
+    assert s.apigee_refresh_body_key == "refresh_token"
 
 
 def test_json_dir_off(tmp_path):

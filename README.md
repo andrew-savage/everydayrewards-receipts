@@ -9,9 +9,10 @@ REST endpoints the Everyday Rewards website calls, after a one-time browser logi
 
 ## How it works
 
-1. **One-time login.** You log in through Woolworths' normal Auth0 login page (email,
-   password, one-time code, passkey - whatever your account needs). The app never sees your
-   password. It keeps the resulting refresh token in `data/tokens.json` (mode `0600`).
+1. **One-time login.** Either sign in on the Everyday Rewards website as usual and hand the
+   app the session your browser stored (`import-session`), or let the app drive the same
+   Auth0 login the website uses (`login`). The app never sees your password. It keeps the
+   resulting bearer and refresh token in `data/tokens.json` (mode `0600`).
 2. **Polling.** Every `EDR_POLL_INTERVAL` (default 6 h) it walks the activity feed, newest
    first, and stops at the first page where every receipt is already saved.
 3. **Download.** For each new receipt it fetches the receipt details (store, total, itemised
@@ -28,47 +29,42 @@ REST endpoints the Everyday Rewards website calls, after a one-time browser logi
 cp .env.example .env            # edit RECEIPTS_DIR / DATA_DIR / PUID / PGID
 mkdir -p receipts data
 docker compose build
-docker compose run --rm everyday-receipts login     # one-time, interactive
+docker compose run --rm everyday-receipts import-session   # one-time, interactive (see below)
+docker compose run --rm everyday-receipts refresh          # proves unattended renewal works
 docker compose up -d
 docker compose logs -f
 ```
 
-### The login step
+### Getting a session (one-time)
 
-`login` prints an Auth0 URL. Open it in any browser, sign in, and you land on
-`https://www.everyday.com.au/callback?code=...&state=...`. Paste that **full address** back
-into the terminal. The app exchanges the code itself; the code is single-use and short-lived.
-
-The Everyday Rewards callback page runs JavaScript that tries to use the code too and then
-navigates away, so you have a few seconds to copy the address bar. Two ways to make this
-painless:
-
-* **Block JavaScript for `www.everyday.com.au` while you log in** (Chrome: Settings →
-  Privacy and security → Site settings → JavaScript → *Not allowed to use JavaScript* → Add
-  `www.everyday.com.au`). The callback page then stays put with the code in the address bar.
-  Remove the rule afterwards. The Auth0 login page is on a different host and is unaffected.
-* **Use a local redirect instead.** Run
-  `docker compose run --rm -p 8765:8765 everyday-receipts login --redirect-uri http://localhost:8765/callback --listen 0.0.0.0:8765`
-  and the app receives the redirect itself. This only works if Woolworths' Auth0 client
-  allows a localhost callback; if Auth0 shows *Callback URL mismatch*, fall back to the
-  first method. (Without `--listen` you can also just copy the failed `localhost` URL from
-  the address bar and paste it.)
-
-When login succeeds the app prints the token lifetimes and how many receipts are on the
-first page of your activity feed.
-
-### Alternative: import the browser session
-
-If the PKCE login gives trouble, log in on https://www.everyday.com.au in a browser, open the
-developer console and run:
+**Option A - import the browser session (recommended).** Sign in at
+https://www.everyday.com.au in any browser. Open the developer console (F12, or Cmd-Opt-J on
+a Mac) and run:
 
 ```js
-copy(localStorage.getItem('authStatusData'))
+copy(localStorage.getItem('authStatusData') || sessionStorage.getItem('authStatusData'))
 ```
 
-then `docker compose run --rm everyday-receipts import-session` and paste. This imports the
-site's bearer and refresh token and renews them through the API's refresh endpoint. Note the
-caveat in [Known unknowns](#known-unknowns).
+That copies a small JSON blob holding the site's bearer and refresh token. Run
+`docker compose run --rm everyday-receipts import-session`, paste it, press Enter. The app
+verifies it by loading your activity feed and prints how long the refresh token lasts.
+
+**Option B - `login`.** `docker compose run --rm everyday-receipts login` asks the
+Everyday Rewards backend for its Auth0 login URL (the same one the "Log in" button uses)
+and prints it. Sign in, and you land on `https://www.everyday.com.au/callback?code=...`.
+Paste that **full address** back into the terminal; the app swaps the code for tokens
+through the site's own token endpoint.
+
+The catch: the callback page runs JavaScript that uses the code itself within a second.
+Block JavaScript for `www.everyday.com.au` in your browser *before* signing in (Chrome:
+Settings → Privacy and security → Site settings → JavaScript → *Not allowed* → add
+`www.everyday.com.au`; remove it afterwards). The Auth0 page is on another host and keeps
+working. `login --redirect-uri http://localhost:8765/callback --listen 0.0.0.0:8765`
+would avoid all that, but Woolworths' Auth0 client only allows its own callback URL; the
+command checks and tells you up front if a redirect URI is rejected.
+
+Whichever option you use, finish with `everyday-receipts refresh`. It forces a token renewal
+and confirms the unattended path works before you rely on it.
 
 ## paperless-ngx setup
 
@@ -112,14 +108,14 @@ All settings are environment variables (see `.env.example`).
 | `EDR_FILENAME_TEMPLATE` | `{date} {partner} {store} {amount} [{short_id}]` | Fields: `date`, `partner`, `store`, `amount`, `short_id`, `receipt_id`, `id`. |
 | `EDR_SUBDIR_BY_PARTNER` | `false` | Write into `Woolworths/`, `BWS/`, ... sub-folders. |
 | `EDR_LOG_LEVEL` | `INFO` | `DEBUG` logs every request. |
-| `EDR_APIGEE_REFRESH_BODY_KEY` | `refresh_token` | JSON key used by the `import-session` refresh call (see below). |
+| `EDR_APIGEE_REFRESH_BODY_KEY` | `refresh_token` | Preferred JSON key for the refresh call; the other spelling is tried automatically and the working one remembered. |
+| `EDR_LOGIN_REDIRECT_URI` | `https://www.everyday.com.au/callback` | Redirect URI requested by `login`. |
 | `EDR_ACCESS_TOKEN` | – | Static bearer for quick testing only (dies after ~30 min). |
 | `EDR_AUTH_STATUS_JSON` | – | Non-interactive equivalent of `import-session`, used only if no session is stored yet. |
 
-Advanced overrides exist for the API hosts and client identifiers (`EDR_API_BASE`,
-`EDR_GRAPHQL_URL`, `EDR_REWARDS_CLIENT_ID`, `EDR_PARTNER_CLIENT_ID`, `EDR_AUTH0_*`,
-`EDR_USER_AGENT`) in case Woolworths changes them; defaults are the values the public web app
-ships with.
+Advanced overrides exist for the API hosts and client identifier (`EDR_API_BASE`,
+`EDR_GRAPHQL_URL`, `EDR_REWARDS_CLIENT_ID`, `EDR_USER_AGENT`) in case Woolworths changes
+them; defaults are the values the public web app ships with.
 
 ## Operating it
 
@@ -132,7 +128,9 @@ docker compose logs -f                                            # what it is d
 * **Health.** `docker ps` shows `(healthy)` once a sync has succeeded within the last
   `2 × EDR_POLL_INTERVAL + 10 min` and no login is pending.
 * **Re-login.** If `data/NEEDS_LOGIN` appears (health `unhealthy`, log line `LOGIN REQUIRED`),
-  run `docker compose run --rm everyday-receipts login` again. Nothing else needs to change.
+  run `import-session` or `login` again. Nothing else needs to change.
+* **Check renewal.** `docker compose run --rm everyday-receipts refresh` forces a token
+  refresh and reports the result.
 * **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by receipt id) or
   delete `state.json` entirely; existing PDFs are never overwritten, so re-scans are safe.
 * **Backfill.** The first run fetches everything Everyday Rewards still holds (about 14
@@ -142,14 +140,15 @@ docker compose logs -f                                            # what it is d
 
 This talks to an unofficial API, so a few things can only be confirmed with a real session:
 
-* **Auth0 refresh token lifetime.** The app refreshes as often as needed, so inactivity
-  limits are not a concern, but Auth0 tenants can set an absolute lifetime. If a re-login is
-  ever demanded, `status` and the logs will say so.
-* **`import-session` refresh call.** The website exposes `/wx/v2/security/refreshToken` but
-  never calls it, so the request body is inferred (`{"refresh_token": ...}`, configurable via
-  `EDR_APIGEE_REFRESH_BODY_KEY`). Prefer the `login` command, which uses documented OAuth.
-* **Callback URL for a local redirect.** Whether Auth0 accepts `http://localhost:...` was not
-  probed; the copy-the-address-bar method always works.
+* **Refresh token lifetime.** The site's token endpoint reports it (`refreshExpiredInSeconds`);
+  `import-session`, `login` and `status` print it. Reports from the mobile app suggest about
+  14 months.
+* **Refresh request body.** The website exposes `/wx/v2/security/refreshToken` but never
+  calls it, so the JSON key is inferred. The app tries `refresh_token` then `refreshToken`
+  and remembers whichever the endpoint accepts; a rejected token (401/403) means a re-login.
+* **Auth0 client.** The site's JavaScript also carries a newer Auth0 SPA client, but Auth0
+  rejects it with *Callback URL mismatch* for the production callback, so the app uses the
+  backend-mediated flow the live site uses.
 
 Using the site's private API may be against Woolworths' terms; the request volume here is
 tiny (one feed page and a few downloads every 6 hours), but use at your own risk.
@@ -163,15 +162,15 @@ uv run everyday-receipts --help
 EDR_DATA_DIR=./data EDR_OUTPUT_DIR=./receipts uv run everyday-receipts login
 ```
 
-Layout: `config.py` (env settings), `auth.py` (PKCE login, token store, refresh),
+Layout: `config.py` (env settings), `auth.py` (login flow, token store, refresh),
 `api.py` + `queries.py` (GraphQL/REST client), `models.py` (feed items, receipt details),
 `naming.py` (dates and filenames), `sync.py` (dedupe + atomic writes), `cli.py`.
 
 ## Credits
 
 Endpoint knowledge builds on [T-Fowl/everyday-rewards-receipts](https://github.com/T-Fowl/everyday-rewards-receipts)
-and [ekutilov/wooliesR](https://github.com/ekutilov/wooliesR); the Auth0 login flow and
-token-exchange endpoint were taken from the public JavaScript of www.everyday.com.au.
+and [ekutilov/wooliesR](https://github.com/ekutilov/wooliesR); the login-url and token
+endpoints were taken from the public JavaScript of www.everyday.com.au.
 
 ## License
 

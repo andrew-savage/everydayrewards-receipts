@@ -10,11 +10,7 @@ from typing import Mapping
 
 # Public identifiers baked into the Everyday Rewards web app (www.everyday.com.au).
 DEFAULT_REWARDS_CLIENT_ID = "8h41mMOiDULmlLT28xKSv5ITpp3XBRvH"
-DEFAULT_PARTNER_CLIENT_ID = "eAjOrRlfHIyqpK1KVX8UlmmCFvfmoGXY"
-DEFAULT_AUTH0_DOMAIN = "https://auth.everyday.com.au"
-DEFAULT_AUTH0_CLIENT_ID = "sOyZPtybxGPItZdk4kCOqro8DU1VeuTw"
-DEFAULT_AUTH0_AUDIENCE = "https://www.woolworthsrewards.com.au/auth/"
-DEFAULT_AUTH0_REDIRECT_URI = "https://www.everyday.com.au/callback"
+DEFAULT_LOGIN_REDIRECT_URI = "https://www.everyday.com.au/callback"
 DEFAULT_API_BASE = "https://api.everyday.com.au"
 DEFAULT_GRAPHQL_URL = "https://apigee-prod.api-wr.com/wx/v1/bff/graphql"
 DEFAULT_USER_AGENT = (
@@ -52,11 +48,7 @@ class Settings:
     api_base: str
     graphql_url: str
     rewards_client_id: str
-    partner_client_id: str
-    auth0_domain: str
-    auth0_client_id: str
-    auth0_audience: str
-    auth0_redirect_uri: str
+    login_redirect_uri: str
     apigee_refresh_body_key: str
     user_agent: str
     request_timeout: float
@@ -93,11 +85,7 @@ class Settings:
             api_base=get("EDR_API_BASE", DEFAULT_API_BASE).rstrip("/"),
             graphql_url=get("EDR_GRAPHQL_URL", DEFAULT_GRAPHQL_URL),
             rewards_client_id=get("EDR_REWARDS_CLIENT_ID", DEFAULT_REWARDS_CLIENT_ID),
-            partner_client_id=get("EDR_PARTNER_CLIENT_ID", DEFAULT_PARTNER_CLIENT_ID),
-            auth0_domain=get("EDR_AUTH0_DOMAIN", DEFAULT_AUTH0_DOMAIN).rstrip("/"),
-            auth0_client_id=get("EDR_AUTH0_CLIENT_ID", DEFAULT_AUTH0_CLIENT_ID),
-            auth0_audience=get("EDR_AUTH0_AUDIENCE", DEFAULT_AUTH0_AUDIENCE),
-            auth0_redirect_uri=get("EDR_AUTH0_REDIRECT_URI", DEFAULT_AUTH0_REDIRECT_URI),
+            login_redirect_uri=get("EDR_LOGIN_REDIRECT_URI", DEFAULT_LOGIN_REDIRECT_URI),
             apigee_refresh_body_key=get("EDR_APIGEE_REFRESH_BODY_KEY", "refresh_token"),
             user_agent=get("EDR_USER_AGENT", DEFAULT_USER_AGENT),
             request_timeout=float(get("EDR_REQUEST_TIMEOUT", "30")),

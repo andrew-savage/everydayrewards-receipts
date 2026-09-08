@@ -1,43 +1,41 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import stat
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
 
 from everyday_receipts.auth import (
     ApigeeTokens,
-    Auth0Tokens,
     AuthError,
     AuthManager,
+    LoginAttempt,
     ReloginRequired,
     TokenStore,
-    build_authorize_url,
-    generate_pkce,
+    make_state,
     parse_redirect,
 )
 
 from conftest import Recorder, make_client
 
+LOGIN_URL_TEMPLATE = (
+    "https://auth.everyday.com.au/authorize?response_type=code&scope=openid%20profile%20offline_access"
+    "&client_id=wWG2vmdG9vsNvGKPQcYz56LwCuRfKVF8&redirect_uri={redirect}"
+    "&audience=https://www.woolworthsrewards.com.au/auth/&ext-newsignup=true&state=abf66c"
+)
 
-def test_pkce_pair_is_valid():
-    verifier, challenge = generate_pkce()
-    assert 43 <= len(verifier) <= 128
-    expected = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-    assert challenge == expected
 
+def test_make_state_is_base64_json_with_nonce():
+    import base64
 
-def test_build_authorize_url(settings):
-    url = build_authorize_url(settings, state="st", code_challenge="ch", redirect_uri="https://www.everyday.com.au/callback")
-    assert url.startswith("https://auth.everyday.com.au/authorize?")
-    assert "client_id=sOyZPtybxGPItZdk4kCOqro8DU1VeuTw" in url
-    assert "scope=openid+profile+offline_access" in url
-    assert "code_challenge_method=S256" in url
-    assert "redirect_uri=https%3A%2F%2Fwww.everyday.com.au%2Fcallback" in url
+    state = make_state()
+    payload = json.loads(base64.b64decode(state))
+    assert payload["redirectUri"] == "https://www.everyday.com.au/"
+    assert payload["nonce"].isdigit()
+    assert make_state() != state or True  # nonce is random; equality is merely unlikely
 
 
 def test_parse_redirect_variants():
@@ -54,124 +52,170 @@ def test_parse_redirect_variants():
         parse_redirect("   ")
 
 
-def _auth0_and_exchange_handler(state: dict):
+def _login_handler(state: dict):
+    """Mocks the login-url, token and refresh endpoints plus Auth0's authorize redirect."""
+
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "auth.everyday.com.au" and request.url.path == "/oauth/token":
-            form = {k: v for k, v in (p.split("=", 1) for p in request.content.decode().split("&"))}
-            state["grants"].append(form["grant_type"])
-            if form["grant_type"] == "refresh_token" and state.get("refresh_rejected"):
-                return httpx.Response(403, json={"error": "invalid_grant", "error_description": "Unknown or invalid refresh token."})
-            body = {"access_token": f"A0-{len(state['grants'])}", "expires_in": 86400, "scope": "openid profile offline_access", "token_type": "Bearer"}
-            if form["grant_type"] == "authorization_code" or state.get("rotate"):
-                body["refresh_token"] = f"RT-{len(state['grants'])}"
-            return httpx.Response(200, json=body)
-        if request.url.path == "/wx/v1/rewardspartner/secure/token-exchange":
-            assert request.headers["client_id"] == "eAjOrRlfHIyqpK1KVX8UlmmCFvfmoGXY"
-            assert request.headers["api-version"] == "2"
+        path = request.url.path
+        if request.url.host == "auth.everyday.com.au" and path == "/authorize":
+            state.setdefault("authorize_hits", 0)
+            state["authorize_hits"] += 1
+            redirect = parse_qs(request.url.query.decode()).get("redirect_uri", [""])[0]
+            if redirect.startswith("http://localhost"):
+                return httpx.Response(302, headers={"location": "https://everyday.com.au/error-generic.html?error=unauthorized_client&error_description=Callback%20URL%20mismatch.%20http%3A%2F%2Flocalhost%3A8765%2Fcallback%20is%20not%20in%20the%20list%20of%20allowed%20callback%20URLs"})
+            return httpx.Response(302, headers={"location": "/u/login/identifier?state=hKFo"})
+        if path == "/wx/v2/security/login/url":
+            assert request.headers["client_id"] == "8h41mMOiDULmlLT28xKSv5ITpp3XBRvH"
+            q = parse_qs(request.url.query.decode())
+            state["login_url_query"] = {k: v[0] for k, v in q.items()}
+            return httpx.Response(200, json={"data": {"url": LOGIN_URL_TEMPLATE.format(redirect=q["redirectUri"][0])}})
+        if path == "/wx/v2/security/token":
             payload = json.loads(request.content)
-            state["exchanged"].append(payload["access_token"])
-            return httpx.Response(200, json={"data": {"accessToken": f"AP-{payload['access_token']}", "accessTokenExpiresIn": "1800"}})
+            state["token_payload"] = payload
+            if payload.get("code") != "GOODCODE":
+                return httpx.Response(400, json={"errors": [{"status": 400, "code": "400", "message": "Invalid state"}]})
+            return httpx.Response(200, json={"data": {
+                "bearer": "BEARER1", "bearerExpiredInSeconds": 1800, "refresh": "REFRESH1",
+                "refreshExpiredInSeconds": 38879999, "state": state.get("expected_state"),
+                "passwordResetRequired": False, "isInactiveCard": False, "twoFAVerified": "true",
+            }})
+        if path == "/wx/v2/security/refreshToken":
+            payload = json.loads(request.content)
+            state.setdefault("refresh_payloads", []).append(payload)
+            assert request.headers["Authorization"].startswith("Bearer ")
+            token = payload.get(state.get("accepted_key", "refresh_token"))
+            if token is None:
+                return httpx.Response(400, json={"errors": [{"status": 400, "code": "400", "message": "Bad Request"}]})
+            if token == "DEAD":
+                return httpx.Response(401, json={"errors": [{"status": 401, "code": "1008", "message": "Refresh Token Invalid"}]})
+            n = len(state["refresh_payloads"])
+            return httpx.Response(200, json={"data": {"bearer": f"BEARER{n + 1}", "bearerExpiredInSeconds": 1800, "refresh": f"REFRESH{n + 1}", "refreshExpiredInSeconds": 38879999}})
         return httpx.Response(404, text="unexpected " + str(request.url))
 
     return handler
 
 
-def test_pkce_login_then_bearer_refresh(settings):
-    st = {"grants": [], "exchanged": [], "rotate": True}
+def test_begin_check_and_complete_login(settings):
+    st: dict = {}
     now = {"t": 1_000_000.0}
     rec = Recorder()
-    http = make_client(_auth0_and_exchange_handler(st), rec)
+    http = make_client(_login_handler(st), rec)
     store = TokenStore(path=settings.token_path)
     auth = AuthManager(settings, store, http, clock=lambda: now["t"])
 
-    auth.complete_pkce_login("CODE", "VERIFIER", "https://www.everyday.com.au/callback")
-    assert rec.form_body(0) == {
-        "grant_type": "authorization_code",
-        "client_id": settings.auth0_client_id,
-        "code": "CODE",
-        "code_verifier": "VERIFIER",
-        "redirect_uri": "https://www.everyday.com.au/callback",
-    }
-    assert rec.requests[0].headers["Auth0-Client"]
-    assert store.mode == "auth0"
-    assert store.auth0.refresh_token == "RT-1"
-    assert store.apigee.access_token == "AP-A0-1"
+    attempt = auth.begin_login("https://www.everyday.com.au/callback")
+    st["expected_state"] = attempt.state
+    assert st["login_url_query"]["redirectUri"] == "https://www.everyday.com.au/callback"
+    assert st["login_url_query"]["state"] == attempt.state
+    assert attempt.url.startswith("https://auth.everyday.com.au/authorize?")
+    assert attempt.auth0_state == "abf66c"
+
+    assert auth.check_login_url(attempt.url) is None
+
+    tokens = auth.complete_login("GOODCODE", "abf66c", attempt)
+    assert st["token_payload"] == {"code": "GOODCODE", "state": "abf66c", "redirectUri": "https://www.everyday.com.au/callback"}
+    assert tokens.access_token == "BEARER1" and tokens.refresh_token == "REFRESH1"
+    assert tokens.refresh_expires_at == pytest.approx(now["t"] + 38879999)
+    assert store.mode == "apigee"
     assert stat.S_IMODE(os.stat(settings.token_path).st_mode) == 0o600
 
-    # Bearer still fresh: no network.
+    # Fresh bearer: no network.
     before = len(rec.requests)
-    assert auth.get_bearer() == "AP-A0-1"
+    assert auth.get_bearer() == "BEARER1"
     assert len(rec.requests) == before
 
-    # Bearer expired but Auth0 access token still valid: only a token exchange happens.
+    # Expired bearer: refreshed with the default body key; refresh token rotated and persisted.
     now["t"] += 1800
-    assert auth.get_bearer() == "AP-A0-1"  # exchange of the same Auth0 token
-    assert st["grants"] == ["authorization_code"]
-    assert st["exchanged"] == ["A0-1", "A0-1"]
-
-    # Auth0 token expired too: refresh grant, rotated refresh token persisted, then exchange.
-    now["t"] += 86400
-    assert auth.get_bearer() == "AP-A0-2"
-    assert st["grants"] == ["authorization_code", "refresh_token"]
-    assert rec.form_body(len(rec.requests) - 2)["refresh_token"] == "RT-1"
+    assert auth.get_bearer() == "BEARER2"
+    assert st["refresh_payloads"] == [{"refresh_token": "REFRESH1"}]
     reloaded = TokenStore.load(settings.token_path)
-    assert reloaded.auth0.refresh_token == "RT-2"
-    assert reloaded.apigee.access_token == "AP-A0-2"
-
-    # A forced refresh (after a 401) always goes back through Auth0.
-    assert auth.get_bearer(force_refresh=True) == "AP-A0-3"
+    assert reloaded.apigee.refresh_token == "REFRESH2"
+    assert reloaded.refresh_body_key == "refresh_token"
 
 
-def test_refresh_without_rotation_keeps_old_refresh_token(settings):
-    st = {"grants": [], "exchanged": [], "rotate": False}
-    now = {"t": 5000.0}
-    http = make_client(_auth0_and_exchange_handler(st))
-    store = TokenStore(mode="auth0", path=settings.token_path)
-    store.auth0 = Auth0Tokens(access_token="old", expires_at=now["t"] - 1, refresh_token="RT-keep")
-    store.apigee = ApigeeTokens(access_token="dead", expires_at=now["t"] - 1)
-    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
-    assert auth.get_bearer() == "AP-A0-1"
-    assert store.auth0.refresh_token == "RT-keep"
+def test_check_login_url_reports_callback_mismatch(settings):
+    st: dict = {}
+    auth = AuthManager(settings, TokenStore(path=settings.token_path), make_client(_login_handler(st)))
+    attempt = auth.begin_login("http://localhost:8765/callback")
+    problem = auth.check_login_url(attempt.url)
+    assert problem is not None and "Callback URL mismatch" in problem
 
 
-def test_rejected_refresh_token_requires_relogin(settings):
-    st = {"grants": [], "exchanged": [], "refresh_rejected": True}
-    now = {"t": 5000.0}
-    http = make_client(_auth0_and_exchange_handler(st))
-    store = TokenStore(mode="auth0", path=settings.token_path)
-    store.auth0 = Auth0Tokens(access_token="old", expires_at=now["t"] - 1, refresh_token="RT-x")
-    store.apigee = ApigeeTokens(access_token="dead", expires_at=now["t"] - 1)
-    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+def test_check_login_url_tolerates_network_errors(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("offline")
+
+    auth = AuthManager(settings, TokenStore(path=settings.token_path), make_client(handler))
+    assert auth.check_login_url("https://auth.everyday.com.au/authorize?x=1") is None
+
+
+def test_complete_login_rejected_code(settings):
+    st: dict = {}
+    auth = AuthManager(settings, TokenStore(path=settings.token_path), make_client(_login_handler(st)))
+    attempt = LoginAttempt(url="u", state="s", redirect_uri="https://www.everyday.com.au/callback", auth0_state="abf66c")
+    with pytest.raises(AuthError, match="Invalid state"):
+        auth.complete_login("BADCODE", None, attempt)
+    assert st["token_payload"]["state"] == "abf66c"
+
+
+def test_refresh_falls_back_to_camel_case_key_and_remembers_it(settings):
+    st: dict = {"accepted_key": "refreshToken"}
+    now = {"t": 50_000.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="OLD", expires_at=now["t"] - 1, refresh_token="R1", refresh_expires_at=now["t"] + 9e6)
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    assert auth.get_bearer() == "BEARER3"
+    assert st["refresh_payloads"] == [{"refresh_token": "R1"}, {"refreshToken": "R1"}]
+    assert TokenStore.load(settings.token_path).refresh_body_key == "refreshToken"
+
+    # Next refresh tries the remembered key first.
+    now["t"] += 1800
+    auth.get_bearer()
+    assert st["refresh_payloads"][2] == {"refreshToken": "REFRESH3"}
+
+
+def test_refresh_rejected_requires_relogin(settings):
+    st: dict = {}
+    now = {"t": 50_000.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="OLD", expires_at=now["t"] - 1, refresh_token="DEAD")
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    with pytest.raises(ReloginRequired):
+        auth.get_bearer()
+
+
+def test_refresh_all_keys_rejected_is_transient_error(settings):
+    st: dict = {"accepted_key": "somethingElse"}
+    now = {"t": 50_000.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="OLD", expires_at=now["t"] - 1, refresh_token="R1")
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    with pytest.raises(AuthError) as exc_info:
+        auth.get_bearer()
+    assert not isinstance(exc_info.value, ReloginRequired)
+    assert len(st["refresh_payloads"]) == 2
+
+
+def test_expired_refresh_token_requires_relogin(settings):
+    now = {"t": 50_000.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="OLD", expires_at=now["t"] - 1, refresh_token="R1", refresh_expires_at=now["t"] - 5)
+    auth = AuthManager(settings, store, make_client(lambda r: httpx.Response(500)), clock=lambda: now["t"])
     with pytest.raises(ReloginRequired):
         auth.get_bearer()
 
 
 def test_no_credentials_requires_login(settings):
-    http = make_client(lambda r: httpx.Response(500))
-    auth = AuthManager(settings, TokenStore(path=settings.token_path), http)
+    auth = AuthManager(settings, TokenStore(path=settings.token_path), make_client(lambda r: httpx.Response(500)))
     with pytest.raises(ReloginRequired):
         auth.get_bearer()
 
 
-def test_import_session_and_apigee_refresh(settings):
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(request)
-        if request.url.path == "/wx/v2/security/refreshToken":
-            assert request.headers["client_id"] == settings.rewards_client_id
-            payload = json.loads(request.content)
-            expected_bearer = "OLDBEARER" if payload.get("refresh_token") == "R1" else "NEWBEARER"
-            assert request.headers["Authorization"] == f"Bearer {expected_bearer}"
-            if payload.get("refresh_token") == "BAD":
-                return httpx.Response(401, json={"errors": [{"status": 401, "code": "1008", "message": "Refresh Token Invalid"}]})
-            return httpx.Response(200, json={"data": {"bearer": "NEWBEARER", "bearerExpiredInSeconds": 1800, "refresh": "R2", "refreshExpiredInSeconds": 38879999}})
-        return httpx.Response(404)
-
+def test_import_session_then_refresh(settings):
+    st: dict = {}
     now = {"t": 100_000.0}
-    http = make_client(handler)
     store = TokenStore(path=settings.token_path)
-    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
     auth.import_auth_status(json.dumps({
         "reason": "AUTHENTICATED", "access_token": "OLDBEARER", "expires_in": 1800,
         "refresh_token": "R1", "refresh_token_expires_in": 38879999, "accessTokenExpired": "N",
@@ -179,15 +223,9 @@ def test_import_session_and_apigee_refresh(settings):
     assert store.mode == "apigee"
     assert auth.get_bearer() == "OLDBEARER"
     now["t"] += 1800
-    assert auth.get_bearer() == "NEWBEARER"
-    assert json.loads(calls[-1].content) == {"refresh_token": "R1"}
-    assert store.apigee.refresh_token == "R2"
-    assert store.apigee.refresh_expires_at == pytest.approx(now["t"] + 38879999)
-
-    store.apigee.refresh_token = "BAD"
-    now["t"] += 1800
-    with pytest.raises(ReloginRequired):
-        auth.get_bearer()
+    assert auth.get_bearer() == "BEARER2"
+    assert st["refresh_payloads"] == [{"refresh_token": "R1"}]
+    assert store.apigee.refresh_token == "REFRESH2"
 
 
 def test_import_session_rejects_garbage(settings):
@@ -216,15 +254,17 @@ def test_static_token_mode(settings):
         auth.get_bearer(force_refresh=True)
 
 
-def test_token_store_roundtrip(tmp_path):
+def test_token_store_roundtrip_and_legacy_file(tmp_path):
     path = tmp_path / "t.json"
-    store = TokenStore(mode="auth0", path=path)
-    store.auth0 = Auth0Tokens(access_token="a", expires_at=1.0, refresh_token="r", scope="openid")
-    store.apigee = ApigeeTokens(access_token="b", expires_at=2.0)
+    store = TokenStore(mode="apigee", path=path, refresh_body_key="refreshToken")
+    store.apigee = ApigeeTokens(access_token="b", expires_at=2.0, refresh_token="r", refresh_expires_at=3.0)
     store.save()
     loaded = TokenStore.load(path)
-    assert loaded.mode == "auth0"
-    assert loaded.auth0 == store.auth0
-    assert loaded.apigee == store.apigee
+    assert loaded.mode == "apigee" and loaded.apigee == store.apigee and loaded.refresh_body_key == "refreshToken"
     loaded.clear()
     assert TokenStore.load(path).mode == "none"
+
+    # A file written by the earlier Auth0-based version still loads.
+    path.write_text(json.dumps({"mode": "auth0", "auth0": {"access_token": "x"}, "apigee": {"access_token": "b", "expires_at": 1.0}}))
+    legacy = TokenStore.load(path)
+    assert legacy.mode == "apigee" and legacy.apigee.access_token == "b"

@@ -1,21 +1,18 @@
 """Authentication against Everyday Rewards.
 
-Two ways to hold a long-lived session are supported:
+The website logs in through Auth0 but never talks to Auth0's token endpoint itself:
+its backend hands out the Auth0 login URL (``/wx/v2/security/login/url``) and later
+swaps the returned code for API tokens (``/wx/v2/security/token``). We drive exactly
+that flow, keep the resulting refresh token, and renew the short-lived bearer with
+``/wx/v2/security/refreshToken``.
 
-* ``auth0`` mode - we run the same Auth0 authorization-code + PKCE login the web app
-  uses, keep the Auth0 refresh token, and exchange Auth0 access tokens for API bearer
-  tokens with the ``token-exchange`` endpoint the web app calls.
-* ``apigee`` mode - the browser's stored ``authStatusData`` (bearer + refresh token) is
-  imported and refreshed through the API's ``/wx/v2/security/refreshToken`` endpoint.
-
-Bearer tokens for the API are short-lived (about 30 minutes), so both modes refresh
-transparently from :meth:`AuthManager.get_bearer`.
+Alternatively the browser's stored ``authStatusData`` (bearer + refresh token) can be
+imported; it is renewed the same way.
 """
 
 from __future__ import annotations
 
 import base64
-import hashlib
 import json
 import logging
 import os
@@ -34,11 +31,9 @@ from .config import Settings
 
 log = logging.getLogger(__name__)
 
-AUTH0_SCOPE = "openid profile offline_access"
-AUTH0_CLIENT_HEADER = base64.b64encode(
-    json.dumps({"name": "auth0-spa-js", "version": "2.23.0"}).encode()
-).decode()
 WEB_ORIGIN = "https://www.everyday.com.au"
+REFRESH_BODY_KEYS = ("refresh_token", "refreshToken")
+REFRESH_TIMEOUT = 60.0
 
 
 class AuthError(Exception):
@@ -58,18 +53,10 @@ class ApigeeTokens:
 
 
 @dataclass
-class Auth0Tokens:
-    access_token: str
-    expires_at: float
-    refresh_token: str | None = None
-    scope: str | None = None
-
-
-@dataclass
 class TokenStore:
-    mode: str = "none"  # none | auth0 | apigee | static
+    mode: str = "none"  # none | apigee | static
     apigee: ApigeeTokens | None = None
-    auth0: Auth0Tokens | None = None
+    refresh_body_key: str | None = None  # JSON key the refresh endpoint accepted last time
     updated_at: float = 0.0
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -77,18 +64,20 @@ class TokenStore:
         return {
             "mode": self.mode,
             "apigee": vars(self.apigee) if self.apigee else None,
-            "auth0": vars(self.auth0) if self.auth0 else None,
+            "refresh_body_key": self.refresh_body_key,
             "updated_at": self.updated_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], path: Path | None = None) -> "TokenStore":
         apigee = data.get("apigee")
-        auth0 = data.get("auth0")
+        mode = data.get("mode", "none")
+        if mode not in ("none", "apigee", "static"):
+            mode = "apigee" if apigee else "none"
         return cls(
-            mode=data.get("mode", "none"),
+            mode=mode,
             apigee=ApigeeTokens(**apigee) if apigee else None,
-            auth0=Auth0Tokens(**auth0) if auth0 else None,
+            refresh_body_key=data.get("refresh_body_key"),
             updated_at=float(data.get("updated_at") or 0.0),
             path=path,
         )
@@ -116,37 +105,24 @@ class TokenStore:
     def clear(self) -> None:
         self.mode = "none"
         self.apigee = None
-        self.auth0 = None
         self.save()
 
 
-# --------------------------------------------------------------------------- PKCE
+@dataclass
+class LoginAttempt:
+    url: str  # Auth0 authorize URL to open in a browser
+    state: str  # state we generated and sent to the backend
+    redirect_uri: str
+    auth0_state: str | None  # state the backend put into the Auth0 URL (echoed back on the callback)
 
 
-def _b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+# --------------------------------------------------------------------------- helpers
 
 
-def generate_pkce() -> tuple[str, str]:
-    """Return (code_verifier, code_challenge) per RFC 7636 (S256)."""
-    verifier = _b64url(secrets.token_bytes(32))
-    challenge = _b64url(hashlib.sha256(verifier.encode("ascii")).digest())
-    return verifier, challenge
-
-
-def build_authorize_url(settings: Settings, *, state: str, code_challenge: str, redirect_uri: str) -> str:
-    params = {
-        "client_id": settings.auth0_client_id,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": AUTH0_SCOPE,
-        "audience": settings.auth0_audience,
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": "S256",
-        "auth0Client": AUTH0_CLIENT_HEADER,
-    }
-    return f"{settings.auth0_domain}/authorize?{urlencode(params)}"
+def make_state() -> str:
+    """State in the same shape the website generates (base64 JSON with a nonce)."""
+    payload = {"redirectUri": WEB_ORIGIN + "/", "nonce": str(secrets.randbelow(1000))}
+    return base64.b64encode(json.dumps(payload).encode()).decode()
 
 
 def parse_redirect(text: str) -> tuple[str, str | None]:
@@ -174,7 +150,7 @@ def parse_redirect(text: str) -> tuple[str, str | None]:
 
 
 def wait_for_callback(host: str, port: int, timeout: float) -> str:
-    """Serve one HTTP request on host:port and return its path (including the query string)."""
+    """Serve HTTP on host:port until a request carrying code= or error= arrives; return its path."""
     result: dict[str, str] = {}
 
     class Handler(BaseHTTPRequestHandler):
@@ -183,7 +159,7 @@ def wait_for_callback(host: str, port: int, timeout: float) -> str:
                 result["path"] = self.path
                 body = b"<html><body><h2>Everyday Receipts: login received. You can close this tab.</h2></body></html>"
             else:
-                body = b"<html><body>Waiting for the Auth0 redirect...</body></html>"
+                body = b"<html><body>Waiting for the login redirect...</body></html>"
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -204,9 +180,6 @@ def wait_for_callback(host: str, port: int, timeout: float) -> str:
     if "path" not in result:
         raise TimeoutError(f"no login redirect arrived on port {port} within {int(timeout)}s")
     return result["path"]
-
-
-# --------------------------------------------------------------------------- helpers
 
 
 def _json_or_error(resp: httpx.Response) -> dict[str, Any]:
@@ -233,6 +206,13 @@ def _pick(data: dict[str, Any], *keys: str) -> Any:
     return None
 
 
+def _error_text(body: dict[str, Any]) -> str:
+    errors = body.get("errors")
+    if isinstance(errors, list) and errors:
+        return "; ".join(f"{e.get('code', '')}: {e.get('message', '')}".strip(": ") for e in errors if isinstance(e, dict))
+    return json.dumps(body)[:300]
+
+
 # --------------------------------------------------------------------------- manager
 
 
@@ -252,116 +232,7 @@ class AuthManager:
         self.clock = clock
         self._lock = threading.RLock()
 
-    # -- public -------------------------------------------------------------
-
-    def get_bearer(self, force_refresh: bool = False) -> str:
-        """Return an API bearer token, refreshing it first if it is (nearly) expired."""
-        with self._lock:
-            tokens = self.store.apigee
-            if (
-                not force_refresh
-                and tokens
-                and tokens.expires_at - self.clock() > self.REFRESH_MARGIN
-            ):
-                return tokens.access_token
-
-            mode = self.store.mode
-            if mode == "static":
-                if force_refresh or not tokens:
-                    raise ReloginRequired("the static EDR_ACCESS_TOKEN was rejected or has expired; supply a new one")
-                return tokens.access_token
-            if mode == "auth0":
-                self._refresh_via_auth0(force=force_refresh)
-            elif mode == "apigee":
-                self._refresh_via_apigee()
-            else:
-                raise ReloginRequired("no credentials stored; run `everyday-receipts login` first")
-            assert self.store.apigee is not None
-            return self.store.apigee.access_token
-
-    def complete_pkce_login(self, code: str, code_verifier: str, redirect_uri: str) -> None:
-        with self._lock:
-            auth0 = self._auth0_token_request(
-                {
-                    "grant_type": "authorization_code",
-                    "client_id": self.settings.auth0_client_id,
-                    "code": code,
-                    "code_verifier": code_verifier,
-                    "redirect_uri": redirect_uri,
-                }
-            )
-            apigee = self._exchange_auth0_token(auth0.access_token)
-            self.store.mode = "auth0"
-            self.store.auth0 = auth0
-            self.store.apigee = apigee
-            self.store.save()
-            if not auth0.refresh_token:
-                log.warning(
-                    "Auth0 did not return a refresh token; this session will stop working when the "
-                    "Auth0 access token expires (about %d min)",
-                    int((auth0.expires_at - self.clock()) / 60),
-                )
-
-    def import_auth_status(self, text: str) -> None:
-        """Import the web app's localStorage ``authStatusData`` JSON blob."""
-        try:
-            data = json.loads(text)
-        except ValueError as exc:
-            raise AuthError(f"authStatusData is not valid JSON: {exc}") from exc
-        if isinstance(data, dict) and isinstance(data.get("authStatus"), dict):
-            data = data["authStatus"]
-        if not isinstance(data, dict) or not data.get("access_token"):
-            raise AuthError("authStatusData has no access_token field")
-        now = self.clock()
-        expires_in = int(data.get("expires_in") or 1800)
-        refresh_token = data.get("refresh_token") or None
-        refresh_expires_in = data.get("refresh_token_expires_in")
-        with self._lock:
-            self.store.mode = "apigee"
-            self.store.auth0 = None
-            self.store.apigee = ApigeeTokens(
-                access_token=str(data["access_token"]),
-                expires_at=now + expires_in,
-                refresh_token=refresh_token,
-                refresh_expires_at=(now + int(refresh_expires_in)) if refresh_expires_in else None,
-            )
-            self.store.save()
-        if not refresh_token:
-            log.warning(
-                "authStatusData has no refresh_token; the imported bearer will stop working in "
-                "about %d minutes. Prefer `everyday-receipts login`.",
-                expires_in // 60,
-            )
-
-    def use_static_token(self, token: str) -> None:
-        with self._lock:
-            self.store.mode = "static"
-            self.store.auth0 = None
-            self.store.apigee = ApigeeTokens(access_token=token, expires_at=self.clock() + 1800)
-
-    def describe(self) -> dict[str, Any]:
-        now = self.clock()
-        info: dict[str, Any] = {"mode": self.store.mode}
-        if self.store.apigee:
-            info["api_bearer_expires_in_s"] = int(self.store.apigee.expires_at - now)
-            info["api_refresh_token"] = bool(self.store.apigee.refresh_token)
-            if self.store.apigee.refresh_expires_at:
-                info["api_refresh_expires_in_s"] = int(self.store.apigee.refresh_expires_at - now)
-        if self.store.auth0:
-            info["auth0_access_expires_in_s"] = int(self.store.auth0.expires_at - now)
-            info["auth0_refresh_token"] = bool(self.store.auth0.refresh_token)
-        return info
-
-    # -- internals ----------------------------------------------------------
-
-    def _auth0_headers(self) -> dict[str, str]:
-        return {
-            "Auth0-Client": AUTH0_CLIENT_HEADER,
-            "Accept": "application/json",
-            "Origin": WEB_ORIGIN,
-            "Referer": WEB_ORIGIN + "/",
-            "User-Agent": self.settings.user_agent,
-        }
+    # -- headers ----------------------------------------------------------------
 
     def api_headers(self, client_id: str) -> dict[str, str]:
         return {
@@ -374,102 +245,200 @@ class AuthManager:
             "User-Agent": self.settings.user_agent,
         }
 
-    def _auth0_token_request(self, form: dict[str, str], fallback_refresh: str | None = None) -> Auth0Tokens:
-        url = f"{self.settings.auth0_domain}/oauth/token"
-        try:
-            resp = self.http.post(url, data=form, headers=self._auth0_headers())
-        except httpx.HTTPError as exc:
-            raise AuthError(f"could not reach Auth0: {exc}") from exc
-        body = _json_or_error(resp)
-        if resp.status_code != 200 or not body.get("access_token"):
-            error = body.get("error", f"http_{resp.status_code}")
-            description = body.get("error_description", "")
-            if form.get("grant_type") == "refresh_token" and error in ("invalid_grant", "unauthorized_client", "access_denied"):
-                raise ReloginRequired(
-                    f"Auth0 refused the refresh token ({error}: {description}); run `everyday-receipts login` again"
-                )
-            raise AuthError(f"Auth0 token request failed ({resp.status_code}): {error}: {description}")
-        now = self.clock()
-        return Auth0Tokens(
-            access_token=body["access_token"],
-            expires_at=now + int(body.get("expires_in") or 3600),
-            refresh_token=body.get("refresh_token") or fallback_refresh,
-            scope=body.get("scope"),
-        )
+    # -- bearer -----------------------------------------------------------------
 
-    def _exchange_auth0_token(self, auth0_access_token: str) -> ApigeeTokens:
-        url = f"{self.settings.api_base}/wx/v1/rewardspartner/secure/token-exchange"
+    def get_bearer(self, force_refresh: bool = False) -> str:
+        """Return an API bearer token, refreshing it first if it is (nearly) expired."""
+        with self._lock:
+            tokens = self.store.apigee
+            if (
+                not force_refresh
+                and tokens
+                and tokens.expires_at - self.clock() > self.REFRESH_MARGIN
+            ):
+                return tokens.access_token
+            mode = self.store.mode
+            if mode == "static":
+                if force_refresh or not tokens:
+                    raise ReloginRequired("the static EDR_ACCESS_TOKEN was rejected or has expired; supply a new one")
+                return tokens.access_token
+            if mode == "apigee":
+                self._refresh()
+            else:
+                raise ReloginRequired("no credentials stored; run `everyday-receipts login` or `import-session` first")
+            assert self.store.apigee is not None
+            return self.store.apigee.access_token
+
+    # -- login ------------------------------------------------------------------
+
+    def begin_login(self, redirect_uri: str) -> LoginAttempt:
+        """Ask the backend for the Auth0 login URL, as the website does."""
+        state = make_state()
+        params = {"state": state, "redirectUri": redirect_uri, "newSignup": "true"}
+        url = f"{self.settings.api_base}/wx/v2/security/login/url?{urlencode(params)}"
         try:
-            resp = self.http.post(
-                url,
-                json={"access_token": auth0_access_token},
-                headers=self.api_headers(self.settings.partner_client_id),
-            )
+            resp = self.http.get(url, headers=self.api_headers(self.settings.rewards_client_id))
         except httpx.HTTPError as exc:
             raise AuthError(f"could not reach the Everyday Rewards API: {exc}") from exc
         body = _json_or_error(resp)
         if resp.status_code != 200:
-            raise AuthError(f"token exchange failed ({resp.status_code}): {json.dumps(body)[:300]}")
-        data = _unwrap(body)
-        access = _pick(data, "accessToken", "access_token", "bearer")
-        ttl = _pick(data, "accessTokenExpiresIn", "expires_in", "bearerExpiredInSeconds")
-        if not access:
-            raise AuthError(f"token exchange returned no access token: {json.dumps(body)[:300]}")
-        return ApigeeTokens(access_token=str(access), expires_at=self.clock() + int(ttl or 1800))
+            raise AuthError(f"login-url request failed ({resp.status_code}): {_error_text(body)}")
+        login_url = _unwrap(body).get("url")
+        if not login_url:
+            raise AuthError(f"login-url response contained no url: {json.dumps(body)[:300]}")
+        auth0_state = parse_qs(urlparse(login_url).query).get("state", [None])[0]
+        return LoginAttempt(url=login_url, state=state, redirect_uri=redirect_uri, auth0_state=auth0_state)
 
-    def _refresh_via_auth0(self, force: bool) -> None:
-        auth0 = self.store.auth0
-        if auth0 is None:
-            raise ReloginRequired("no Auth0 session stored; run `everyday-receipts login`")
-        if force or auth0.expires_at - self.clock() <= self.REFRESH_MARGIN:
-            if not auth0.refresh_token:
-                raise ReloginRequired("the Auth0 session has expired and no refresh token is available; run `everyday-receipts login`")
-            log.info("refreshing Auth0 session")
-            auth0 = self._auth0_token_request(
-                {
-                    "grant_type": "refresh_token",
-                    "client_id": self.settings.auth0_client_id,
-                    "refresh_token": auth0.refresh_token,
-                },
-                fallback_refresh=auth0.refresh_token,
+    def check_login_url(self, url: str) -> str | None:
+        """Return Auth0's up-front rejection (e.g. callback URL mismatch), or None if the URL looks usable."""
+        try:
+            resp = self.http.get(
+                url,
+                headers={"Accept": "text/html", "User-Agent": self.settings.user_agent},
+                follow_redirects=False,
             )
-            self.store.auth0 = auth0
-            self.store.save()  # persist immediately: rotated refresh tokens are single-use
-        log.info("exchanging Auth0 token for an API bearer")
-        self.store.apigee = self._exchange_auth0_token(auth0.access_token)
-        self.store.save()
+        except httpx.HTTPError as exc:
+            log.warning("could not pre-check the login URL (%s); continuing anyway", exc)
+            return None
+        location = resp.headers.get("location", "")
+        if "error=" in location:
+            query = parse_qs(urlparse(location).query)
+            return f"{query.get('error', ['error'])[0]}: {query.get('error_description', [''])[0]}"
+        if resp.status_code >= 400:
+            return f"Auth0 responded with HTTP {resp.status_code}"
+        return None
 
-    def _refresh_via_apigee(self) -> None:
+    def complete_login(self, code: str, callback_state: str | None, attempt: LoginAttempt) -> ApigeeTokens:
+        """Swap the code from the callback URL for API tokens via the backend."""
+        payload = {
+            "code": code,
+            "state": callback_state or attempt.auth0_state or attempt.state,
+            "redirectUri": attempt.redirect_uri,
+        }
+        url = f"{self.settings.api_base}/wx/v2/security/token"
+        try:
+            resp = self.http.post(url, json=payload, headers=self.api_headers(self.settings.rewards_client_id))
+        except httpx.HTTPError as exc:
+            raise AuthError(f"could not reach the Everyday Rewards API: {exc}") from exc
+        body = _json_or_error(resp)
+        if resp.status_code != 200:
+            raise AuthError(f"Everyday Rewards rejected the login code ({resp.status_code}): {_error_text(body)}")
+        data = _unwrap(body)
+        returned_state = data.get("state")
+        if returned_state and returned_state != attempt.state:
+            log.warning("token endpoint returned a different state than we generated; continuing")
+        if data.get("passwordResetRequired"):
+            log.warning("Everyday Rewards says this account must reset its password; receipts may not load until that is done")
+        with self._lock:
+            return self._store_tokens(data, source="login")
+
+    def import_auth_status(self, text: str) -> None:
+        """Import the web app's localStorage ``authStatusData`` JSON blob."""
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            raise AuthError(f"authStatusData is not valid JSON: {exc}") from exc
+        if isinstance(data, dict) and isinstance(data.get("authStatus"), dict):
+            data = data["authStatus"]
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise AuthError("authStatusData has no access_token field")
+        with self._lock:
+            tokens = self._store_tokens(data, source="import")
+        if not tokens.refresh_token:
+            log.warning(
+                "authStatusData has no refresh_token; the imported bearer will stop working in about %d minutes",
+                int((tokens.expires_at - self.clock()) // 60),
+            )
+
+    def use_static_token(self, token: str) -> None:
+        with self._lock:
+            self.store.mode = "static"
+            self.store.apigee = ApigeeTokens(access_token=token, expires_at=self.clock() + 1800)
+
+    def describe(self) -> dict[str, Any]:
+        now = self.clock()
+        info: dict[str, Any] = {"mode": self.store.mode}
+        if self.store.apigee:
+            info["api_bearer_expires_in_s"] = int(self.store.apigee.expires_at - now)
+            info["api_refresh_token"] = bool(self.store.apigee.refresh_token)
+            if self.store.apigee.refresh_expires_at:
+                info["api_refresh_expires_in_s"] = int(self.store.apigee.refresh_expires_at - now)
+        if self.store.refresh_body_key:
+            info["refresh_body_key"] = self.store.refresh_body_key
+        return info
+
+    # -- internals --------------------------------------------------------------
+
+    def _store_tokens(
+        self,
+        data: dict[str, Any],
+        *,
+        source: str,
+        fallback_refresh: str | None = None,
+        fallback_refresh_expires_at: float | None = None,
+    ) -> ApigeeTokens:
+        access = _pick(data, "bearer", "access_token", "accessToken")
+        ttl = _pick(data, "bearerExpiredInSeconds", "expires_in", "accessTokenExpiresIn")
+        refresh = _pick(data, "refresh", "refresh_token", "refreshToken")
+        refresh_ttl = _pick(data, "refreshExpiredInSeconds", "refresh_token_expires_in", "refreshTokenExpiresIn")
+        if not access:
+            raise AuthError(f"{source} response had no bearer token: {json.dumps(data)[:300]}")
+        now = self.clock()
+        tokens = ApigeeTokens(
+            access_token=str(access),
+            expires_at=now + int(ttl or 1800),
+            refresh_token=str(refresh) if refresh else fallback_refresh,
+            refresh_expires_at=(now + int(refresh_ttl)) if refresh_ttl else fallback_refresh_expires_at,
+        )
+        self.store.mode = "apigee"
+        self.store.apigee = tokens
+        self.store.save()
+        return tokens
+
+    def _refresh(self) -> None:
         tokens = self.store.apigee
         if tokens is None or not tokens.refresh_token:
-            raise ReloginRequired("the imported session has no refresh token; run `everyday-receipts login` or import a fresh authStatusData")
+            raise ReloginRequired("the stored session has no refresh token; run `everyday-receipts login` or `import-session`")
         now = self.clock()
         if tokens.refresh_expires_at and tokens.refresh_expires_at <= now:
-            raise ReloginRequired("the imported refresh token has expired; log in again")
+            raise ReloginRequired("the refresh token has expired; run `everyday-receipts login` again")
+
+        keys: list[str] = []
+        for key in (self.store.refresh_body_key, self.settings.apigee_refresh_body_key, *REFRESH_BODY_KEYS):
+            if key and key not in keys:
+                keys.append(key)
         url = f"{self.settings.api_base}/wx/v2/security/refreshToken"
         headers = self.api_headers(self.settings.rewards_client_id)
         headers["Authorization"] = f"Bearer {tokens.access_token}"
-        log.info("refreshing API bearer via %s", url)
-        try:
-            resp = self.http.post(url, json={self.settings.apigee_refresh_body_key: tokens.refresh_token}, headers=headers)
-        except httpx.HTTPError as exc:
-            raise AuthError(f"could not reach the Everyday Rewards API: {exc}") from exc
-        body = _json_or_error(resp)
-        if resp.status_code in (400, 401, 403):
-            raise ReloginRequired(f"Everyday Rewards refused the refresh token ({resp.status_code}): {json.dumps(body)[:300]}")
-        if resp.status_code != 200:
-            raise AuthError(f"refresh failed ({resp.status_code}): {json.dumps(body)[:300]}")
-        data = _unwrap(body)
-        access = _pick(data, "bearer", "access_token", "accessToken")
-        ttl = _pick(data, "bearerExpiredInSeconds", "expires_in", "accessTokenExpiresIn")
-        new_refresh = _pick(data, "refresh", "refresh_token", "refreshToken")
-        refresh_ttl = _pick(data, "refreshExpiredInSeconds", "refresh_token_expires_in", "refreshTokenExpiresIn")
-        if not access:
-            raise AuthError(f"refresh response had no bearer: {json.dumps(body)[:300]}")
-        self.store.apigee = ApigeeTokens(
-            access_token=str(access),
-            expires_at=now + int(ttl or 1800),
-            refresh_token=str(new_refresh) if new_refresh else tokens.refresh_token,
-            refresh_expires_at=(now + int(refresh_ttl)) if refresh_ttl else tokens.refresh_expires_at,
-        )
-        self.store.save()
+        last_error: AuthError | None = None
+        for key in keys:
+            log.info("refreshing API bearer via %s (body key %r)", url, key)
+            try:
+                resp = self.http.post(url, json={key: tokens.refresh_token}, headers=headers, timeout=REFRESH_TIMEOUT)
+            except httpx.HTTPError as exc:
+                raise AuthError(f"could not reach the Everyday Rewards API: {exc}") from exc
+            try:
+                body = _json_or_error(resp)
+            except AuthError as exc:
+                last_error = exc
+                continue
+            if resp.status_code in (401, 403):
+                raise ReloginRequired(f"Everyday Rewards refused the refresh token ({resp.status_code}): {_error_text(body)}")
+            if resp.status_code != 200:
+                last_error = AuthError(f"refresh failed ({resp.status_code}) with body key {key!r}: {_error_text(body)}")
+                continue
+            data = _unwrap(body)
+            if not _pick(data, "bearer", "access_token", "accessToken"):
+                last_error = AuthError(f"refresh response had no bearer (body key {key!r}): {json.dumps(body)[:300]}")
+                continue
+            if key != self.store.refresh_body_key:
+                log.info("refresh endpoint accepted body key %r; remembering it", key)
+                self.store.refresh_body_key = key
+            self._store_tokens(
+                data,
+                source="refresh",
+                fallback_refresh=tokens.refresh_token,
+                fallback_refresh_expires_at=tokens.refresh_expires_at,
+            )
+            return
+        raise last_error or AuthError("refresh failed")

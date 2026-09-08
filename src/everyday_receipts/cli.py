@@ -1,10 +1,9 @@
-"""Command line entry point: login, import-session, once, run, status, healthcheck."""
+"""Command line entry point: login, import-session, refresh, once, run, status, healthcheck."""
 
 from __future__ import annotations
 
 import argparse
 import logging
-import secrets
 import signal
 import sys
 import time
@@ -19,8 +18,6 @@ from .auth import (
     AuthManager,
     ReloginRequired,
     TokenStore,
-    build_authorize_url,
-    generate_pkce,
     parse_redirect,
     wait_for_callback,
 )
@@ -38,6 +35,18 @@ def _setup_logging(level: str) -> None:
         stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _fmt_seconds(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds < 0:
+        return "expired"
+    if seconds >= 2 * 86400:
+        return f"{seconds // 86400} days"
+    if seconds >= 2 * 3600:
+        return f"{seconds // 3600} hours"
+    return f"{seconds // 60} min"
 
 
 class App:
@@ -75,28 +84,48 @@ class App:
         first_page = next(self.client.iter_activity_pages(), [])
         return sum(1 for item in first_page if item.has_receipt)
 
+    def _print_session_summary(self, receipts: int | None = None) -> None:
+        info = self.auth.describe()
+        print(f"  API bearer valid for : {_fmt_seconds(info.get('api_bearer_expires_in_s'))} (renewed automatically)")
+        if info.get("api_refresh_token"):
+            print(f"  Refresh token        : yes, valid for {_fmt_seconds(info.get('api_refresh_expires_in_s'))}")
+        else:
+            print("  Refresh token        : NO - unattended renewal will not work")
+        if info.get("refresh_body_key"):
+            print(f"  Refresh body key     : {info['refresh_body_key']}")
+        if receipts is not None:
+            print(f"  Receipts on 1st page : {receipts}")
+
     # -- commands --------------------------------------------------------------
 
     def cmd_login(self, args: argparse.Namespace) -> int:
-        redirect_uri = args.redirect_uri or self.settings.auth0_redirect_uri
-        verifier, challenge = generate_pkce()
-        state = secrets.token_urlsafe(16)
-        url = build_authorize_url(self.settings, state=state, code_challenge=challenge, redirect_uri=redirect_uri)
+        redirect_uri = args.redirect_uri or self.settings.login_redirect_uri
+        try:
+            attempt = self.auth.begin_login(redirect_uri)
+        except AuthError as exc:
+            print(f"error: could not start the login: {exc}", file=sys.stderr)
+            return 1
+        problem = self.auth.check_login_url(attempt.url)
+        if problem:
+            print(f"error: Auth0 will not accept this login request: {problem}", file=sys.stderr)
+            if args.redirect_uri:
+                print("hint: that redirect URI is not on Woolworths' allow-list; run `login` without --redirect-uri", file=sys.stderr)
+            return 2
 
         print()
         print("=" * 78)
         print("Everyday Rewards login")
         print("=" * 78)
-        print("1. Open this URL in a browser and log in (email, password, any one-time code):")
+        print("1. Open this URL in a browser and sign in (email, password, one-time code):")
         print()
-        print(f"   {url}")
+        print(f"   {attempt.url}")
         print()
-        print(f"2. After logging in you will be redirected to {redirect_uri}")
-        if redirect_uri.startswith("https://www.everyday.com.au"):
-            print("   That page will spin and may try to log you in itself. Before it moves on,")
-            print("   copy the FULL address from the browser's address bar (it contains code=...).")
-            print("   Tip: temporarily blocking JavaScript for www.everyday.com.au in your browser's")
-            print("   site settings keeps the page from navigating away, making this easy.")
+        print(f"2. After signing in you will be redirected to {redirect_uri}")
+        if redirect_uri.startswith(("https://www.everyday.com.au", "https://everyday.com.au")):
+            print("   That page will immediately use the code itself and move on. To stop it:")
+            print("   block JavaScript for www.everyday.com.au in your browser's site settings")
+            print("   BEFORE signing in, then copy the FULL address (it contains code=...).")
+            print("   (Easier alternative: `everyday-receipts import-session` after a normal login.)")
         elif not args.listen:
             print("   The browser will show an error page (nothing listens there); that is fine.")
             print("   Copy the FULL address from the address bar (it contains code=...).")
@@ -119,36 +148,40 @@ class App:
                 return 2
 
         try:
-            code, returned_state = parse_redirect(pasted)
+            code, callback_state = parse_redirect(pasted)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
-        if returned_state is not None and returned_state != state and not args.ignore_state:
-            print("error: the state in the redirect does not match this login attempt; start again", file=sys.stderr)
+        if (
+            callback_state is not None
+            and attempt.auth0_state is not None
+            and callback_state != attempt.auth0_state
+            and not args.ignore_state
+
+        ):
+            print("error: the state in the redirect does not belong to this login attempt; start again", file=sys.stderr)
             return 2
 
         try:
-            self.auth.complete_pkce_login(code, verifier, redirect_uri)
+            self.auth.complete_login(code, callback_state, attempt)
             receipts = self.verify_session()
         except (AuthError, ApiError) as exc:
             print(f"\nlogin failed: {exc}", file=sys.stderr)
             return 1
         self._set_needs_login(None)
-        info = self.auth.describe()
         print()
         print("Login successful. Session stored in", self.settings.token_path)
-        print(f"  API bearer valid for   : {info.get('api_bearer_expires_in_s', 0) // 60} min (auto-refreshed)")
-        print(f"  Auth0 access token     : {info.get('auth0_access_expires_in_s', 0) // 60} min")
-        print(f"  Auth0 refresh token    : {'yes' if info.get('auth0_refresh_token') else 'NO - unattended refresh will not work'}")
-        print(f"  Receipts on first page : {receipts}")
+        self._print_session_summary(receipts)
+        print("Next: run `everyday-receipts refresh` once to confirm unattended renewal works.")
         return 0
 
     def cmd_import_session(self, args: argparse.Namespace) -> int:
         if args.file:
             text = Path(args.file).read_text(encoding="utf-8")
         else:
-            print("Log in at https://www.everyday.com.au, open the browser console and run:")
-            print("    copy(localStorage.getItem('authStatusData'))")
+            print("Sign in at https://www.everyday.com.au in a browser, open the developer console")
+            print("(F12 / Cmd-Opt-J) and run:")
+            print("    copy(localStorage.getItem('authStatusData') || sessionStorage.getItem('authStatusData'))")
             print("then paste the result here and press Enter:")
             try:
                 text = input("> ")
@@ -162,13 +195,25 @@ class App:
             print(f"import failed: {exc}", file=sys.stderr)
             return 1
         self._set_needs_login(None)
-        info = self.auth.describe()
         print("Session imported.")
-        print(f"  API bearer valid for : {info.get('api_bearer_expires_in_s', 0) // 60} min")
-        print(f"  Refresh token        : {'yes' if info.get('api_refresh_token') else 'NO - this session dies in ~30 min'}")
-        if info.get("api_refresh_expires_in_s") is not None:
-            print(f"  Refresh token valid  : {info['api_refresh_expires_in_s'] // 86400} days")
-        print(f"  Receipts on first page: {receipts}")
+        self._print_session_summary(receipts)
+        print("Next: run `everyday-receipts refresh` once to confirm unattended renewal works.")
+        return 0
+
+    def cmd_refresh(self, args: argparse.Namespace) -> int:
+        try:
+            self.auth.get_bearer(force_refresh=True)
+            receipts = self.verify_session()
+        except ReloginRequired as exc:
+            self._set_needs_login(str(exc))
+            print(f"refresh failed, login required: {exc}", file=sys.stderr)
+            return 3
+        except (AuthError, ApiError) as exc:
+            print(f"refresh failed: {exc}", file=sys.stderr)
+            return 1
+        self._set_needs_login(None)
+        print("Refresh OK: a new bearer was issued and the activity feed loads.")
+        self._print_session_summary(receipts)
         return 0
 
     def cmd_once(self, args: argparse.Namespace) -> int:
@@ -204,7 +249,7 @@ class App:
                 self._touch_heartbeat()
             except ReloginRequired as exc:
                 self._set_needs_login(str(exc))
-                log.error("LOGIN REQUIRED - run `everyday-receipts login` in this container: %s", exc)
+                log.error("LOGIN REQUIRED - run `everyday-receipts login` or `import-session`: %s", exc)
             except (AuthError, ApiError) as exc:
                 log.error("sync failed; will retry next cycle: %s", exc)
             except Exception:  # keep the service alive on unexpected errors
@@ -217,12 +262,8 @@ class App:
     def cmd_status(self, args: argparse.Namespace) -> int:
         info = self.auth.describe()
         print(f"auth mode            : {info['mode']}")
-        if "api_bearer_expires_in_s" in info:
-            print(f"API bearer expires in: {info['api_bearer_expires_in_s'] // 60} min")
-        if "auth0_refresh_token" in info:
-            print(f"Auth0 refresh token  : {'yes' if info['auth0_refresh_token'] else 'no'}")
-        if "api_refresh_token" in info:
-            print(f"API refresh token    : {'yes' if info['api_refresh_token'] else 'no'}")
+        if info["mode"] != "none":
+            self._print_session_summary()
         print(f"receipts saved       : {len(self.state.seen)}")
         print(f"last sync            : {self.state.last_sync or 'never'}")
         if self.settings.needs_login_path.exists():
@@ -251,15 +292,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="interactive one-time login (Auth0 PKCE flow)")
+    login = sub.add_parser("login", help="interactive one-time login through the Everyday Rewards login page")
     login.add_argument("--redirect-uri", help="override the redirect URI (default: the web app's callback URL)")
     login.add_argument("--listen", metavar="[HOST:]PORT", help="listen locally for the redirect instead of pasting it")
     login.add_argument("--timeout", type=int, default=600, help="seconds to wait when using --listen")
     login.add_argument("--ignore-state", action="store_true", help="skip the OAuth state check")
 
-    imp = sub.add_parser("import-session", help="import the browser's authStatusData JSON")
+    imp = sub.add_parser("import-session", help="import the browser's authStatusData JSON (easiest)")
     imp.add_argument("--file", help="read the JSON from a file instead of stdin")
 
+    sub.add_parser("refresh", help="force a token refresh now and report the result")
     sub.add_parser("once", help="sync once and exit")
     sub.add_parser("run", help="sync forever on EDR_POLL_INTERVAL (default command)")
     sub.add_parser("status", help="show session and sync state")
