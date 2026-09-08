@@ -268,3 +268,93 @@ def test_token_store_roundtrip_and_legacy_file(tmp_path):
     path.write_text(json.dumps({"mode": "auth0", "auth0": {"access_token": "x"}, "apigee": {"access_token": "b", "expires_at": 1.0}}))
     legacy = TokenStore.load(path)
     assert legacy.mode == "apigee" and legacy.apigee.access_token == "b"
+
+
+# --------------------------------------------------------------------------- console paste + keepalive
+
+from everyday_receipts.auth import parse_auth_status  # noqa: E402
+
+RAW = '{"reason":"AUTHENTICATED","access_token":"A","expires_in":3599,"refresh_token":"R","refresh_token_expires_in":7199,"isTempPassword":false}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        RAW,
+        f"  {RAW}\n",
+        json.dumps(RAW),  # double-encoded, as Chrome/Safari display stored strings
+        json.dumps(RAW) + " = $1",  # Safari appends a console variable marker
+        "'" + RAW + "'",
+        '{"authStatus": ' + RAW + "}",
+        RAW.replace('"', '\\"'),  # escaped quotes without outer quotes
+    ],
+)
+def test_parse_auth_status_variants(text):
+    data = parse_auth_status(text)
+    assert data["access_token"] == "A"
+    assert data["refresh_token"] == "R"
+    assert data["refresh_token_expires_in"] == 7199
+
+
+def test_parse_auth_status_rejects_junk():
+    with pytest.raises(AuthError):
+        parse_auth_status("undefined")
+    with pytest.raises(AuthError):
+        parse_auth_status('{"reason":"x"}')
+    with pytest.raises(AuthError):
+        parse_auth_status("")
+
+
+def test_keepalive_schedule_for_short_lived_refresh_token(settings):
+    st: dict = {}
+    now = {"t": 100_000.0}
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    auth.import_auth_status(RAW)  # bearer 3599 s, refresh 7199 s
+    assert store.apigee.refresh_lifetime == 7199
+
+    assert auth.keepalive_due() is False
+    assert auth.keepalive() is False
+    now["t"] += 3000  # 4199 s of refresh life left: more than half, bearer still valid
+    assert auth.keepalive_due() is False
+    now["t"] += 700  # bearer within the refresh margin -> due
+    assert auth.keepalive_due() is True
+    assert auth.keepalive() is True
+    assert st["refresh_payloads"] == [{"refresh_token": "R"}]
+    # Renewed: new refresh token with a fresh lifetime, so nothing is due right away.
+    assert store.apigee.refresh_token == "REFRESH2"
+    assert store.apigee.refresh_expires_at == pytest.approx(now["t"] + 38879999)
+    assert auth.keepalive_due() is False
+
+
+def test_keepalive_due_by_refresh_half_life(settings):
+    now = {"t": 0.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="B", expires_at=1e9, refresh_token="R", refresh_expires_at=7200.0, refresh_lifetime=7200.0)
+    auth = AuthManager(settings, store, make_client(lambda r: httpx.Response(500)), clock=lambda: now["t"])
+    assert auth.keepalive_due() is False
+    now["t"] = 3599.0
+    assert auth.keepalive_due() is False
+    now["t"] = 3601.0
+    assert auth.keepalive_due() is True
+
+
+def test_keepalive_not_applicable_without_refresh_token(settings):
+    store = TokenStore(mode="static", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="B", expires_at=0.0)
+    auth = AuthManager(settings, store, make_client(lambda r: httpx.Response(500)))
+    assert auth.keepalive_due() is False
+
+
+def test_refresh_without_rotation_keeps_lifetime(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"data": {"bearer": "NEW", "bearerExpiredInSeconds": 3599}})
+
+    now = {"t": 0.0}
+    store = TokenStore(mode="apigee", path=settings.token_path)
+    store.apigee = ApigeeTokens(access_token="OLD", expires_at=-1.0, refresh_token="R", refresh_expires_at=7000.0, refresh_lifetime=7199.0)
+    auth = AuthManager(settings, store, make_client(handler), clock=lambda: now["t"])
+    assert auth.get_bearer() == "NEW"
+    assert store.apigee.refresh_token == "R"
+    assert store.apigee.refresh_expires_at == 7000.0
+    assert store.apigee.refresh_lifetime == 7199.0

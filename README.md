@@ -19,9 +19,10 @@ REST endpoints the Everyday Rewards website calls, after a one-time browser logi
    lines) and the PDF, then writes the PDF atomically into the output folder as
    `2026-09-06 Woolworths Ashfield $90.86 [3f2a9c1e].pdf`. An itemised JSON copy goes to
    `data/json/` (not into the consume folder).
-4. **Refresh.** API bearer tokens last about 30 minutes; they are refreshed automatically
-   from the stored refresh token. If that ever stops working, the container's health check
-   turns unhealthy and a `data/NEEDS_LOGIN` file explains why.
+4. **Refresh.** API bearer tokens last about an hour and the web refresh token only about
+   two, so the service renews the session on its own schedule (roughly every hour) even
+   between syncs. If renewal ever stops working, the container's health check turns
+   unhealthy and a `data/NEEDS_LOGIN` file explains why.
 
 ## Quick start
 
@@ -48,6 +49,12 @@ copy(localStorage.getItem('authStatusData') || sessionStorage.getItem('authStatu
 That copies a small JSON blob holding the site's bearer and refresh token. Run
 `docker compose run --rm everyday-receipts import-session`, paste it, press Enter. The app
 verifies it by loading your activity feed and prints how long the refresh token lasts.
+Pasting the console's *displayed* form is fine too (with `\"` escapes, surrounding quotes,
+or a trailing ` = $1`); the importer unwraps it.
+
+Because the web refresh token lives only about two hours, keep the container running: it
+renews the session every hour or so. If it is stopped for longer than the refresh token's
+lifetime, run `import-session` again.
 
 **Option B - `login`.** `docker compose run --rm everyday-receipts login` asks the
 Everyday Rewards backend for its Auth0 login URL (the same one the "Log in" button uses)
@@ -140,9 +147,9 @@ docker compose logs -f                                            # what it is d
 
 This talks to an unofficial API, so a few things can only be confirmed with a real session:
 
-* **Refresh token lifetime.** The site's token endpoint reports it (`refreshExpiredInSeconds`);
-  `import-session`, `login` and `status` print it. Reports from the mobile app suggest about
-  14 months.
+* **Refresh token rotation.** The web session's refresh token lasts about two hours (the
+  mobile app reportedly gets months). Staying logged in therefore depends on each refresh
+  handing back a new refresh token; `everyday-receipts refresh` reports whether it did.
 * **Refresh request body.** The website exposes `/wx/v2/security/refreshToken` but never
   calls it, so the JSON key is inferred. The app tries `refresh_token` then `refreshToken`
   and remembers whichever the endpoint accepts; a rejected token (401/403) means a re-login.

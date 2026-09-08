@@ -89,6 +89,11 @@ class App:
         print(f"  API bearer valid for : {_fmt_seconds(info.get('api_bearer_expires_in_s'))} (renewed automatically)")
         if info.get("api_refresh_token"):
             print(f"  Refresh token        : yes, valid for {_fmt_seconds(info.get('api_refresh_expires_in_s'))}")
+            lifetime = info.get("api_refresh_lifetime_s")
+            if lifetime:
+                print(f"  Session keepalive    : renewed every ~{_fmt_seconds(int(lifetime // 2))} while the service runs")
+                if lifetime < 86400:
+                    print(f"  NOTE: if the container is stopped for more than {_fmt_seconds(int(lifetime))}, run import-session again")
         else:
             print("  Refresh token        : NO - unattended renewal will not work")
         if info.get("refresh_body_key"):
@@ -201,6 +206,7 @@ class App:
         return 0
 
     def cmd_refresh(self, args: argparse.Namespace) -> int:
+        before = self.store.apigee.refresh_token if self.store.apigee else None
         try:
             self.auth.get_bearer(force_refresh=True)
             receipts = self.verify_session()
@@ -212,8 +218,12 @@ class App:
             print(f"refresh failed: {exc}", file=sys.stderr)
             return 1
         self._set_needs_login(None)
-        print("Refresh OK: a new bearer was issued and the activity feed loads.")
+        after = self.store.apigee.refresh_token if self.store.apigee else None
+        rotated = "a new refresh token was issued" if after and after != before else "the refresh token was NOT rotated"
+        print(f"Refresh OK: a new bearer was issued, {rotated}, and the activity feed loads.")
         self._print_session_summary(receipts)
+        if after and after == before and self.store.apigee and self.store.apigee.refresh_lifetime and self.store.apigee.refresh_lifetime < 86400:
+            print("WARNING: without rotation the session will end when the refresh token expires; report this output.")
         return 0
 
     def cmd_once(self, args: argparse.Namespace) -> int:
@@ -255,9 +265,26 @@ class App:
             except Exception:  # keep the service alive on unexpected errors
                 log.exception("unexpected error during sync")
             deadline = time.time() + interval
+            next_check = 0.0
             while not stop["flag"] and time.time() < deadline:
+                if time.time() >= next_check:
+                    next_check = time.time() + 60
+                    self._keepalive_tick()
                 time.sleep(min(5, max(0.0, deadline - time.time())))
         return 0
+
+    def _keepalive_tick(self) -> None:
+        """Renew the refresh token between syncs so short-lived sessions survive the poll interval."""
+        try:
+            if self.auth.keepalive():
+                log.info("session renewed (keepalive)")
+                self._set_needs_login(None)
+        except ReloginRequired as exc:
+            if not self.settings.needs_login_path.exists():
+                log.error("LOGIN REQUIRED - run `everyday-receipts import-session` or `login`: %s", exc)
+            self._set_needs_login(str(exc))
+        except AuthError as exc:
+            log.warning("session keepalive failed; will retry: %s", exc)
 
     def cmd_status(self, args: argparse.Namespace) -> int:
         info = self.auth.describe()

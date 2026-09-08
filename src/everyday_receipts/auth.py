@@ -16,6 +16,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -50,6 +51,7 @@ class ApigeeTokens:
     expires_at: float
     refresh_token: str | None = None
     refresh_expires_at: float | None = None
+    refresh_lifetime: float | None = None  # seconds the refresh token was valid for when issued
 
 
 @dataclass
@@ -123,6 +125,38 @@ def make_state() -> str:
     """State in the same shape the website generates (base64 JSON with a nonce)."""
     payload = {"redirectUri": WEB_ORIGIN + "/", "nonce": str(secrets.randbelow(1000))}
     return base64.b64encode(json.dumps(payload).encode()).decode()
+
+
+def parse_auth_status(text: str) -> dict[str, Any]:
+    """Parse ``authStatusData`` however a browser console happened to render it.
+
+    Accepts the raw JSON, a JSON string literal wrapping it (Safari/Chrome show the
+    stored value escaped, e.g. ``"{\"reason\":...}"``), a trailing `` = $1`` marker,
+    surrounding quotes, and the ``{"authStatus": {...}}`` store shape.
+    """
+    cleaned = text.strip()
+    cleaned = re.sub(r"\s*=\s*\$\d+\s*$", "", cleaned)  # Safari's " = $1" suffix
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in "'\"" and not cleaned.startswith('"{'):
+        cleaned = cleaned[1:-1]
+    data: Any = None
+    for attempt in range(3):
+        try:
+            data = json.loads(cleaned)
+        except ValueError:
+            if attempt == 0 and "\\\"" in cleaned:
+                cleaned = cleaned.replace("\\\"", '"')
+                cleaned = cleaned.strip("'\"") if not cleaned.startswith("{") else cleaned
+                continue
+            raise AuthError("authStatusData is not valid JSON; paste exactly what localStorage.getItem('authStatusData') returns") from None
+        if isinstance(data, str):
+            cleaned = data  # double-encoded: unwrap and parse again
+            continue
+        break
+    if isinstance(data, dict) and isinstance(data.get("authStatus"), dict):
+        data = data["authStatus"]
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise AuthError("authStatusData has no access_token field; are you logged in on www.everyday.com.au?")
+    return data
 
 
 def parse_redirect(text: str) -> tuple[str, str | None]:
@@ -334,14 +368,7 @@ class AuthManager:
 
     def import_auth_status(self, text: str) -> None:
         """Import the web app's localStorage ``authStatusData`` JSON blob."""
-        try:
-            data = json.loads(text)
-        except ValueError as exc:
-            raise AuthError(f"authStatusData is not valid JSON: {exc}") from exc
-        if isinstance(data, dict) and isinstance(data.get("authStatus"), dict):
-            data = data["authStatus"]
-        if not isinstance(data, dict) or not data.get("access_token"):
-            raise AuthError("authStatusData has no access_token field")
+        data = parse_auth_status(text)
         with self._lock:
             tokens = self._store_tokens(data, source="import")
         if not tokens.refresh_token:
@@ -349,6 +376,32 @@ class AuthManager:
                 "authStatusData has no refresh_token; the imported bearer will stop working in about %d minutes",
                 int((tokens.expires_at - self.clock()) // 60),
             )
+
+    def keepalive_due(self, now: float | None = None) -> bool:
+        """True when the refresh token should be renewed to keep the session alive.
+
+        Refresh tokens from the web login are short-lived (about two hours), so a service
+        that only syncs every few hours must renew them in between. We renew once less than
+        half the lifetime (or five minutes) remains, or when the bearer itself has expired.
+        """
+        tokens = self.store.apigee
+        if self.store.mode != "apigee" or tokens is None or not tokens.refresh_token:
+            return False
+        now = self.clock() if now is None else now
+        if tokens.expires_at - now <= self.REFRESH_MARGIN:
+            return True
+        if tokens.refresh_expires_at is None:
+            return False
+        threshold = max(300.0, (tokens.refresh_lifetime or 0.0) / 2)
+        return tokens.refresh_expires_at - now <= threshold
+
+    def keepalive(self) -> bool:
+        """Renew the session if :meth:`keepalive_due`; returns True when a refresh happened."""
+        with self._lock:
+            if not self.keepalive_due():
+                return False
+            self._refresh()
+            return True
 
     def use_static_token(self, token: str) -> None:
         with self._lock:
@@ -363,6 +416,8 @@ class AuthManager:
             info["api_refresh_token"] = bool(self.store.apigee.refresh_token)
             if self.store.apigee.refresh_expires_at:
                 info["api_refresh_expires_in_s"] = int(self.store.apigee.refresh_expires_at - now)
+            if self.store.apigee.refresh_lifetime:
+                info["api_refresh_lifetime_s"] = int(self.store.apigee.refresh_lifetime)
         if self.store.refresh_body_key:
             info["refresh_body_key"] = self.store.refresh_body_key
         return info
@@ -376,6 +431,7 @@ class AuthManager:
         source: str,
         fallback_refresh: str | None = None,
         fallback_refresh_expires_at: float | None = None,
+        fallback_refresh_lifetime: float | None = None,
     ) -> ApigeeTokens:
         access = _pick(data, "bearer", "access_token", "accessToken")
         ttl = _pick(data, "bearerExpiredInSeconds", "expires_in", "accessTokenExpiresIn")
@@ -389,6 +445,7 @@ class AuthManager:
             expires_at=now + int(ttl or 1800),
             refresh_token=str(refresh) if refresh else fallback_refresh,
             refresh_expires_at=(now + int(refresh_ttl)) if refresh_ttl else fallback_refresh_expires_at,
+            refresh_lifetime=float(refresh_ttl) if refresh_ttl else fallback_refresh_lifetime,
         )
         self.store.mode = "apigee"
         self.store.apigee = tokens
@@ -439,6 +496,7 @@ class AuthManager:
                 source="refresh",
                 fallback_refresh=tokens.refresh_token,
                 fallback_refresh_expires_at=tokens.refresh_expires_at,
+                fallback_refresh_lifetime=tokens.refresh_lifetime,
             )
             return
         raise last_error or AuthError("refresh failed")
