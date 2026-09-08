@@ -5,3 +5,4 @@ __pycache__/
 data/
 receipts/
 .env
+.DS_Store
