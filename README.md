@@ -43,14 +43,14 @@ https://www.everyday.com.au in any browser. Open the developer console (F12, or 
 a Mac) and run:
 
 ```js
-copy(localStorage.getItem('authStatusData') || sessionStorage.getItem('authStatusData'))
+localStorage.getItem('authStatusData')
 ```
 
-That copies a small JSON blob holding the site's bearer and refresh token. Run
+It prints a small JSON blob holding the site's bearer and refresh token. Select and copy
+exactly what it printed (the escaped `\"` form, surrounding quotes and Safari's trailing
+` = $1` are all fine; the importer unwraps them). Run
 `docker compose run --rm everyday-receipts import-session`, paste it, press Enter. The app
 verifies it by loading your activity feed and prints how long the refresh token lasts.
-Pasting the console's *displayed* form is fine too (with `\"` escapes, surrounding quotes,
-or a trailing ` = $1`); the importer unwraps it.
 
 Because the web refresh token lives only about two hours, keep the container running: it
 renews the session every hour or so. If it is stopped for longer than the refresh token's
@@ -110,7 +110,7 @@ All settings are environment variables (see `.env.example`).
 | `EDR_DATA_DIR` | `/data` | Tokens, sync state, heartbeat, JSON sidecars. |
 | `EDR_JSON_DIR` | `/data/json` | Itemised JSON per receipt; `off` disables. Keep it out of the consume folder. |
 | `EDR_POLL_INTERVAL` | `6h` | Sync frequency (`30m`, `6h`, `1d`). |
-| `EDR_FULL_SCAN` | `false` | Walk the entire 14-month history every run instead of stopping at known receipts. |
+| `EDR_FULL_SCAN` | `false` | Walk the entire history every run instead of stopping at known receipts. |
 | `EDR_MAX_PAGES` | `60` | Safety cap on feed pages per run. |
 | `EDR_FILENAME_TEMPLATE` | `{date} {partner} {store} {amount} [{short_id}]` | Fields: `date`, `partner`, `store`, `amount`, `short_id`, `receipt_id`, `id`. |
 | `EDR_SUBDIR_BY_PARTNER` | `false` | Write into `Woolworths/`, `BWS/`, ... sub-folders. |
@@ -140,8 +140,9 @@ docker compose logs -f                                            # what it is d
   refresh and reports the result.
 * **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by receipt id) or
   delete `state.json` entirely; existing PDFs are never overwritten, so re-scans are safe.
-* **Backfill.** The first run fetches everything Everyday Rewards still holds (about 14
-  months). Fuel and points-only activities have no e-receipt and are skipped.
+* **Backfill.** The first run fetches everything Everyday Rewards still holds (close to three
+  years in practice, several hundred receipts). Fuel and points-only activities have no
+  e-receipt and are skipped.
 
 ## Known unknowns
 

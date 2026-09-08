@@ -186,8 +186,9 @@ class App:
         else:
             print("Sign in at https://www.everyday.com.au in a browser, open the developer console")
             print("(F12 / Cmd-Opt-J) and run:")
-            print("    copy(localStorage.getItem('authStatusData') || sessionStorage.getItem('authStatusData'))")
-            print("then paste the result here and press Enter:")
+            print("    localStorage.getItem('authStatusData')")
+            print("Copy the value it prints (quotes, backslashes and any trailing ' = $1' are fine),")
+            print("paste it here and press Enter:")
             try:
                 text = input("> ")
             except EOFError:
