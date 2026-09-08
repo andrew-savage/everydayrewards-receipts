@@ -21,6 +21,8 @@ def test_defaults(tmp_path):
     assert s.poll_interval == 21600
     assert s.full_scan is False
     assert s.token_path == tmp_path / "tokens.json"
+    assert s.api_base == "https://api.everyday.com.au"
+    assert s.security_base == "https://apigee-prod.api-wr.com"
     assert s.login_redirect_uri == "https://www.everyday.com.au/callback"
     assert s.apigee_refresh_body_key == "refresh_token"
 

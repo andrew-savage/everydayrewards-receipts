@@ -121,8 +121,11 @@ All settings are environment variables (see `.env.example`).
 | `EDR_AUTH_STATUS_JSON` | – | Non-interactive equivalent of `import-session`, used only if no session is stored yet. |
 
 Advanced overrides exist for the API hosts and client identifier (`EDR_API_BASE`,
-`EDR_GRAPHQL_URL`, `EDR_REWARDS_CLIENT_ID`, `EDR_USER_AGENT`) in case Woolworths changes
-them; defaults are the values the public web app ships with.
+`EDR_SECURITY_BASE`, `EDR_GRAPHQL_URL`, `EDR_REWARDS_CLIENT_ID`, `EDR_USER_AGENT`) in case
+Woolworths changes them; defaults are the values the public web app ships with.
+`EDR_SECURITY_BASE` (default `https://apigee-prod.api-wr.com`) is the host for login and
+token refresh: those routes respond only on the direct apigee gateway, not on the
+Akamai-fronted `api.everyday.com.au` alias, where they hang.
 
 ## Operating it
 
@@ -149,8 +152,10 @@ docker compose logs -f                                            # what it is d
 This talks to an unofficial API, so a few things can only be confirmed with a real session:
 
 * **Refresh token rotation.** The web session's refresh token lasts about two hours (the
-  mobile app reportedly gets months). Staying logged in therefore depends on each refresh
-  handing back a new refresh token; `everyday-receipts refresh` reports whether it did.
+  mobile app reportedly gets months), so staying logged in depends on each refresh handing
+  back a new refresh token before the old one expires. The service renews well ahead of
+  time; `everyday-receipts refresh` reports whether a new refresh token came back. If a
+  future change ever stops rotation, the fallback is the mobile app's long-lived token.
 * **Refresh request body.** The website exposes `/wx/v2/security/refreshToken` but never
   calls it, so the JSON key is inferred. The app tries `refresh_token` then `refreshToken`
   and remembers whichever the endpoint accepts; a rejected token (401/403) means a re-login.

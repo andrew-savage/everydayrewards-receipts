@@ -12,6 +12,9 @@ from typing import Mapping
 DEFAULT_REWARDS_CLIENT_ID = "8h41mMOiDULmlLT28xKSv5ITpp3XBRvH"
 DEFAULT_LOGIN_REDIRECT_URI = "https://www.everyday.com.au/callback"
 DEFAULT_API_BASE = "https://api.everyday.com.au"
+# Login/refresh routes only respond on the direct apigee gateway; the Akamai-fronted
+# api.everyday.com.au / api.woolworthsrewards.com.au aliases hang on /wx/v2/security/refreshToken.
+DEFAULT_SECURITY_BASE = "https://apigee-prod.api-wr.com"
 DEFAULT_GRAPHQL_URL = "https://apigee-prod.api-wr.com/wx/v1/bff/graphql"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -46,6 +49,7 @@ class Settings:
     filename_template: str
     subdir_by_partner: bool
     api_base: str
+    security_base: str
     graphql_url: str
     rewards_client_id: str
     login_redirect_uri: str
@@ -83,6 +87,7 @@ class Settings:
             filename_template=get("EDR_FILENAME_TEMPLATE", DEFAULT_FILENAME_TEMPLATE),
             subdir_by_partner=parse_bool(get("EDR_SUBDIR_BY_PARTNER", "false")),
             api_base=get("EDR_API_BASE", DEFAULT_API_BASE).rstrip("/"),
+            security_base=get("EDR_SECURITY_BASE", DEFAULT_SECURITY_BASE).rstrip("/"),
             graphql_url=get("EDR_GRAPHQL_URL", DEFAULT_GRAPHQL_URL),
             rewards_client_id=get("EDR_REWARDS_CLIENT_ID", DEFAULT_REWARDS_CLIENT_ID),
             login_redirect_uri=get("EDR_LOGIN_REDIRECT_URI", DEFAULT_LOGIN_REDIRECT_URI),

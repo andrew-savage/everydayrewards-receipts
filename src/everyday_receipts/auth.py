@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 
 WEB_ORIGIN = "https://www.everyday.com.au"
 REFRESH_BODY_KEYS = ("refresh_token", "refreshToken")
-REFRESH_TIMEOUT = 60.0
+REFRESH_TIMEOUT = 25.0
 
 
 class AuthError(Exception):
@@ -309,7 +309,7 @@ class AuthManager:
         """Ask the backend for the Auth0 login URL, as the website does."""
         state = make_state()
         params = {"state": state, "redirectUri": redirect_uri, "newSignup": "true"}
-        url = f"{self.settings.api_base}/wx/v2/security/login/url?{urlencode(params)}"
+        url = f"{self.settings.security_base}/wx/v2/security/login/url?{urlencode(params)}"
         try:
             resp = self.http.get(url, headers=self.api_headers(self.settings.rewards_client_id))
         except httpx.HTTPError as exc:
@@ -349,7 +349,7 @@ class AuthManager:
             "state": callback_state or attempt.auth0_state or attempt.state,
             "redirectUri": attempt.redirect_uri,
         }
-        url = f"{self.settings.api_base}/wx/v2/security/token"
+        url = f"{self.settings.security_base}/wx/v2/security/token"
         try:
             resp = self.http.post(url, json=payload, headers=self.api_headers(self.settings.rewards_client_id))
         except httpx.HTTPError as exc:
@@ -464,7 +464,7 @@ class AuthManager:
         for key in (self.store.refresh_body_key, self.settings.apigee_refresh_body_key, *REFRESH_BODY_KEYS):
             if key and key not in keys:
                 keys.append(key)
-        url = f"{self.settings.api_base}/wx/v2/security/refreshToken"
+        url = f"{self.settings.security_base}/wx/v2/security/refreshToken"
         headers = self.api_headers(self.settings.rewards_client_id)
         headers["Authorization"] = f"Bearer {tokens.access_token}"
         last_error: AuthError | None = None
