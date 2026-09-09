@@ -181,6 +181,21 @@ class App:
         return 0
 
     def cmd_import_session(self, args: argparse.Namespace) -> int:
+        if args.refresh_token:
+            try:
+                self.auth.import_tokens(
+                    refresh_token=args.refresh_token,
+                    access_token=args.access_token,
+                    refresh_lifetime=float(args.refresh_lifetime) if args.refresh_lifetime else None,
+                )
+                receipts = self.verify_session()
+            except (AuthError, ApiError) as exc:
+                print(f"import failed: {exc}", file=sys.stderr)
+                return 1
+            self._set_needs_login(None)
+            print("Token imported.")
+            self._print_session_summary(receipts)
+            return 0
         if args.file:
             text = Path(args.file).read_text(encoding="utf-8")
         else:
@@ -328,6 +343,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     imp = sub.add_parser("import-session", help="import the browser's authStatusData JSON (easiest)")
     imp.add_argument("--file", help="read the JSON from a file instead of stdin")
+    imp.add_argument("--refresh-token", help="import a refresh token directly (e.g. captured from the mobile app)")
+    imp.add_argument("--access-token", help="the matching bearer token (optional; minted from the refresh token if omitted)")
+    imp.add_argument("--refresh-lifetime", help="seconds the refresh token is valid (e.g. 38879999 for a mobile token)")
 
     sub.add_parser("refresh", help="force a token refresh now and report the result")
     sub.add_parser("once", help="sync once and exit")

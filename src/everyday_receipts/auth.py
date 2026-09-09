@@ -127,12 +127,33 @@ def make_state() -> str:
     return base64.b64encode(json.dumps(payload).encode()).decode()
 
 
-def parse_auth_status(text: str) -> dict[str, Any]:
-    """Parse ``authStatusData`` however a browser console happened to render it.
+_ACCESS_KEYS = ("bearer", "access_token", "accessToken")
+_REFRESH_KEYS = ("refresh", "refresh_token", "refreshToken")
 
-    Accepts the raw JSON, a JSON string literal wrapping it (Safari/Chrome show the
-    stored value escaped, e.g. ``"{\"reason\":...}"``), a trailing `` = $1`` marker,
-    surrounding quotes, and the ``{"authStatus": {...}}`` store shape.
+
+def _find_token_dict(obj: Any) -> dict[str, Any] | None:
+    """Depth-first search for the dict that carries a bearer/access token."""
+    if isinstance(obj, dict):
+        if any(obj.get(k) for k in _ACCESS_KEYS):
+            return obj
+        for value in obj.values():
+            found = _find_token_dict(value)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = _find_token_dict(value)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_auth_status(text: str) -> dict[str, Any]:
+    """Parse a captured session however it was rendered.
+
+    Accepts the browser's ``authStatusData`` (raw, a JSON string literal with ``\"``
+    escapes, a trailing `` = $1`` marker, or surrounding quotes) and also the nested
+    shapes a proxy capture of the mobile app produces, e.g. ``{"data":{"login":{...}}}``.
     """
     cleaned = text.strip()
     cleaned = re.sub(r"\s*=\s*\$\d+\s*$", "", cleaned)  # Safari's " = $1" suffix
@@ -147,16 +168,15 @@ def parse_auth_status(text: str) -> dict[str, Any]:
                 cleaned = cleaned.replace("\\\"", '"')
                 cleaned = cleaned.strip("'\"") if not cleaned.startswith("{") else cleaned
                 continue
-            raise AuthError("authStatusData is not valid JSON; paste exactly what localStorage.getItem('authStatusData') returns") from None
+            raise AuthError("that is not valid JSON; paste exactly what the console printed") from None
         if isinstance(data, str):
             cleaned = data  # double-encoded: unwrap and parse again
             continue
         break
-    if isinstance(data, dict) and isinstance(data.get("authStatus"), dict):
-        data = data["authStatus"]
-    if not isinstance(data, dict) or not data.get("access_token"):
-        raise AuthError("authStatusData has no access_token field; are you logged in on www.everyday.com.au?")
-    return data
+    token_dict = _find_token_dict(data)
+    if token_dict is None:
+        raise AuthError("no access/bearer token found in what you pasted; are you logged in?")
+    return token_dict
 
 
 def parse_redirect(text: str) -> tuple[str, str | None]:
@@ -371,10 +391,36 @@ class AuthManager:
         data = parse_auth_status(text)
         with self._lock:
             tokens = self._store_tokens(data, source="import")
+        self._warn_about_lifetime(tokens)
+
+    def import_tokens(self, *, refresh_token: str, access_token: str | None, refresh_lifetime: float | None = None) -> None:
+        """Store a session from a directly-supplied refresh token (e.g. captured from the app)."""
+        now = self.clock()
+        with self._lock:
+            self.store.mode = "apigee"
+            self.store.apigee = ApigeeTokens(
+                access_token=access_token or "",
+                expires_at=now if not access_token else now + 3300,
+                refresh_token=refresh_token,
+                refresh_expires_at=(now + refresh_lifetime) if refresh_lifetime else None,
+                refresh_lifetime=refresh_lifetime,
+            )
+            self.store.save()
+            if not access_token:
+                self._refresh()  # mint a bearer straight away
+            self._warn_about_lifetime(self.store.apigee)
+
+    def _warn_about_lifetime(self, tokens: ApigeeTokens) -> None:
         if not tokens.refresh_token:
             log.warning(
-                "authStatusData has no refresh_token; the imported bearer will stop working in about %d minutes",
+                "no refresh token in this session; the bearer will stop working in about %d minutes",
                 int((tokens.expires_at - self.clock()) // 60),
+            )
+        elif tokens.refresh_lifetime and tokens.refresh_lifetime < 6 * 3600:
+            log.warning(
+                "this refresh token lasts only ~%d minutes (a web session). For unattended use, "
+                "import a mobile-app token instead; see the README.",
+                int(tokens.refresh_lifetime // 60),
             )
 
     def keepalive_due(self, now: float | None = None) -> bool:

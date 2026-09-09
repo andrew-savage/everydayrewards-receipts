@@ -358,3 +358,36 @@ def test_refresh_without_rotation_keeps_lifetime(settings):
     assert store.apigee.refresh_token == "R"
     assert store.apigee.refresh_expires_at == 7000.0
     assert store.apigee.refresh_lifetime == 7199.0
+
+
+# --------------------------------------------------------------------------- nested shapes + direct import
+
+def test_parse_auth_status_finds_nested_mobile_shapes():
+    assert parse_auth_status(json.dumps({"data": {"login": {"bearer": "B", "refresh": "R"}}}))["bearer"] == "B"
+    assert parse_auth_status(json.dumps({"data": {"access_token": "B2", "refresh_token": "R2"}}))["refresh_token"] == "R2"
+    with pytest.raises(AuthError):
+        parse_auth_status(json.dumps({"data": {"nothing": 1}}))
+
+
+def test_import_tokens_with_access_token(settings):
+    st: dict = {}
+    now = {"t": 100.0}
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    auth.import_tokens(refresh_token="R", access_token="B", refresh_lifetime=38879999)
+    assert store.mode == "apigee"
+    assert auth.get_bearer() == "B"
+    assert store.apigee.refresh_lifetime == 38879999
+    # No keepalive needed yet with a 14-month token.
+    assert auth.keepalive_due() is False
+
+
+def test_import_tokens_without_access_token_mints_bearer(settings):
+    st: dict = {}
+    now = {"t": 100.0}
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, make_client(_login_handler(st)), clock=lambda: now["t"])
+    auth.import_tokens(refresh_token="R", access_token=None, refresh_lifetime=38879999)
+    # import_tokens refreshed immediately to obtain a bearer.
+    assert store.apigee.access_token == "BEARER2"
+    assert st["refresh_payloads"] == [{"refresh_token": "R"}]

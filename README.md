@@ -19,10 +19,12 @@ REST endpoints the Everyday Rewards website calls, after a one-time browser logi
    lines) and the PDF, then writes the PDF atomically into the output folder as
    `2026-09-06 Woolworths Ashfield $90.86 [3f2a9c1e].pdf`. An itemised JSON copy goes to
    `data/json/` (not into the consume folder).
-4. **Refresh.** API bearer tokens last about an hour and the web refresh token only about
-   two, so the service renews the session on its own schedule (roughly every hour) even
-   between syncs. If renewal ever stops working, the container's health check turns
-   unhealthy and a `data/NEEDS_LOGIN` file explains why.
+4. **Refresh.** API bearer tokens last about an hour. A **mobile-app** session also carries
+   a refresh token good for ~14 months, which the service uses to mint fresh bearers
+   unattended. A **browser** session's refresh token lasts only ~2 hours and cannot be
+   renewed (see [Session lifetime](#session-lifetime-important)), so it is useful for a
+   one-off backfill but not for running unattended. If renewal stops, the health check turns
+   unhealthy and `data/NEEDS_LOGIN` explains why.
 
 ## Quick start
 
@@ -38,7 +40,7 @@ docker compose logs -f
 
 ### Getting a session (one-time)
 
-**Option A - import the browser session (recommended).** Sign in at
+**Option A - import the browser session (quickest, for the backfill).** Sign in at
 https://www.everyday.com.au in any browser. Open the developer console (F12, or Cmd-Opt-J on
 a Mac) and run:
 
@@ -72,6 +74,46 @@ command checks and tells you up front if a redirect URI is rejected.
 
 Whichever option you use, finish with `everyday-receipts refresh`. It forces a token renewal
 and confirms the unattended path works before you rely on it.
+
+## Session lifetime (important)
+
+There are two kinds of session, and they behave very differently:
+
+| Source | Refresh token lasts | Good for |
+| --- | --- | --- |
+| Browser (`import-session` of `authStatusData`) | ~2 hours, **not renewable** | one-off backfill of your history |
+| Mobile app (captured refresh token) | ~14 months, renewed automatically | running unattended |
+
+The Everyday Rewards **website never refreshes its own session** - it makes you log in again
+when the token expires - and its refresh token is rejected by the refresh endpoint. So a
+browser session cannot be kept alive: after about an hour the container will report
+`LOGIN REQUIRED`. That is fine for the initial import of your back-catalogue, which finishes
+in minutes.
+
+For unattended running you need the **mobile app's** long-lived refresh token. You capture it
+once with an HTTPS debugging proxy on your phone:
+
+1. Install [HTTP Toolkit](https://httptoolkit.com/) (free) on a computer, or mitmproxy, and
+   set your phone to use it as a proxy with its CA certificate trusted. HTTP Toolkit's
+   Android/iOS setup walks you through both.
+2. Open the Everyday Rewards app and log in (or just open it if already logged in - it
+   refreshes on launch).
+3. In the proxy, find a request to `api-wr.com` or `woolworthsrewards.com.au` whose JSON
+   response contains `"refresh"` and `"refreshExpiredInSeconds"` (a big number like
+   `38879999`). Copy the `refresh` value, and note `refreshExpiredInSeconds`.
+4. Import it:
+
+   ```bash
+   docker compose run --rm everyday-receipts import-session \
+     --refresh-token 'PASTE_THE_REFRESH_VALUE' --refresh-lifetime 38879999
+   ```
+
+   The app mints a bearer from it immediately and prints the lifetime. Then
+   `docker compose up -d` and it runs on its own, renewing every hour or so for ~14 months.
+
+If the mobile refresh token is ever rejected, capture a fresh one the same way. If the
+capture also includes the request's `client_id` header and it differs from the default, set
+`EDR_REWARDS_CLIENT_ID` to match.
 
 ## paperless-ngx setup
 
@@ -151,11 +193,14 @@ docker compose logs -f                                            # what it is d
 
 This talks to an unofficial API, so a few things can only be confirmed with a real session:
 
-* **Refresh token rotation.** The web session's refresh token lasts about two hours (the
-  mobile app reportedly gets months), so staying logged in depends on each refresh handing
-  back a new refresh token before the old one expires. The service renews well ahead of
-  time; `everyday-receipts refresh` reports whether a new refresh token came back. If a
-  future change ever stops rotation, the fallback is the mobile app's long-lived token.
+* **Web sessions cannot be renewed.** Confirmed 2026-09: neither the current site nor the
+  old one refreshes its session (both log out on expiry), and the refresh endpoint rejects a
+  browser refresh token (`1013 Invalid Refresh Token`). Unattended running therefore needs a
+  mobile-app token (see [Session lifetime](#session-lifetime-important)).
+* **Mobile token endpoint details.** The mobile refresh token is expected to work with
+  `/wx/v2/security/refreshToken` on the apigee gateway (that is the app's own endpoint), but
+  the exact `client_id` header the app uses was not captured; override `EDR_REWARDS_CLIENT_ID`
+  if a captured token is rejected with the default.
 * **Refresh request body.** The website exposes `/wx/v2/security/refreshToken` but never
   calls it, so the JSON key is inferred. The app tries `refresh_token` then `refreshToken`
   and remembers whichever the endpoint accepts; a rejected token (401/403) means a re-login.
