@@ -82,7 +82,7 @@ def _login_handler(state: dict):
         if path == "/wx/v2/security/refreshToken":
             payload = json.loads(request.content)
             state.setdefault("refresh_payloads", []).append(payload)
-            assert request.headers["Authorization"].startswith("Bearer ")
+            assert request.headers.get("Authorization", "Bearer x").startswith("Bearer ")
             token = payload.get(state.get("accepted_key", "refresh_token"))
             if token is None:
                 return httpx.Response(400, json={"errors": [{"status": 400, "code": "400", "message": "Bad Request"}]})
@@ -391,3 +391,20 @@ def test_import_tokens_without_access_token_mints_bearer(settings):
     # import_tokens refreshed immediately to obtain a bearer.
     assert store.apigee.access_token == "BEARER2"
     assert st["refresh_payloads"] == [{"refresh_token": "R"}]
+
+
+
+def test_import_tokens_without_access_no_bearer_header(settings):
+    """A refresh with no current bearer must omit Authorization, not send 'Bearer '."""
+    seen = {}
+
+    def handler(request):
+        seen["auth_present"] = "authorization" in {k.lower() for k in request.headers}
+        return httpx.Response(200, json={"data": {"bearer": "NEW", "bearerExpiredInSeconds": 3599, "refresh": "R2", "refreshExpiredInSeconds": 38879999}})
+
+    now = {"t": 0.0}
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, make_client(handler), clock=lambda: now["t"])
+    auth.import_tokens(refresh_token="R", access_token=None, refresh_lifetime=38879999)
+    assert store.apigee.access_token == "NEW"
+    assert seen["auth_present"] is False

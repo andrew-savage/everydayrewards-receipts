@@ -512,7 +512,8 @@ class AuthManager:
                 keys.append(key)
         url = f"{self.settings.security_base}/wx/v2/security/refreshToken"
         headers = self.api_headers(self.settings.rewards_client_id)
-        headers["Authorization"] = f"Bearer {tokens.access_token}"
+        if tokens.access_token:
+            headers["Authorization"] = f"Bearer {tokens.access_token}"
         last_error: AuthError | None = None
         for key in keys:
             log.info("refreshing API bearer via %s (body key %r)", url, key)
