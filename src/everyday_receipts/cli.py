@@ -303,8 +303,14 @@ class App:
         self._print_session_summary(receipts)
         return 0
 
+    def _current_refresh_token(self) -> str | None:
+        """The refresh token that actually keeps this session alive, per mode."""
+        if self.store.mode == "auth0" and self.store.auth0:
+            return self.store.auth0.refresh_token
+        return self.store.apigee.refresh_token if self.store.apigee else None
+
     def cmd_refresh(self, args: argparse.Namespace) -> int:
-        before = self.store.apigee.refresh_token if self.store.apigee else None
+        before = self._current_refresh_token()
         try:
             self.auth.get_bearer(force_refresh=True)
             receipts = self.verify_session()
@@ -316,12 +322,26 @@ class App:
             print(f"refresh failed: {exc}", file=sys.stderr)
             return 1
         self._set_needs_login(None)
-        after = self.store.apigee.refresh_token if self.store.apigee else None
-        rotated = "a new refresh token was issued" if after and after != before else "the refresh token was NOT rotated"
-        print(f"Refresh OK: a new bearer was issued, {rotated}, and the activity feed loads.")
+        after = self._current_refresh_token()
+        if after and before and after != before:
+            rotated = "the refresh token was rotated and the new one saved"
+        elif self.store.mode == "auth0":
+            # Auth0 native clients with rotation disabled keep one long-lived refresh token.
+            rotated = "the app refresh token is unchanged (rotation is off, which is expected)"
+        else:
+            rotated = "the refresh token was NOT rotated"
+        print(f"Refresh OK: a new bearer was issued, {rotated}, and the receipts feed loads.")
         self._print_session_summary(receipts)
-        if after and after == before and self.store.apigee and self.store.apigee.refresh_lifetime and self.store.apigee.refresh_lifetime < 86400:
-            print("WARNING: without rotation the session will end when the refresh token expires; report this output.")
+        if (
+            self.store.mode != "auth0"
+            and after
+            and after == before
+            and self.store.apigee
+            and self.store.apigee.refresh_lifetime
+            and self.store.apigee.refresh_lifetime < 86400
+        ):
+            print("WARNING: without rotation this web session ends when its refresh token expires;")
+            print("         import an app token for unattended use.")
         return 0
 
     def cmd_once(self, args: argparse.Namespace) -> int:

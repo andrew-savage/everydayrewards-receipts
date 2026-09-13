@@ -556,3 +556,21 @@ def test_auth0_keepalive_due_when_jwt_near_expiry(settings):
     assert auth.keepalive_due() is False
     now["t"] = 800.0  # within AUTH0_MARGIN (300) of 1000
     assert auth.keepalive_due() is True
+
+
+def test_current_refresh_token_tracks_the_right_token_per_mode(settings, tmp_path):
+    """In app-token mode the durable token is the Auth0 one, not the (absent) apigee one."""
+    from everyday_receipts.cli import App
+
+    class _App(App):
+        def __init__(self, store):  # bypass network setup
+            self.store = store
+
+    auth0_store = TokenStore(mode="auth0", path=tmp_path / "a.json")
+    auth0_store.auth0 = Auth0Tokens(refresh_token="APP-RT", access_token="jwt", expires_at=1.0)
+    auth0_store.apigee = ApigeeTokens(access_token="bearer", expires_at=2.0)  # no refresh token here
+    assert _App(auth0_store)._current_refresh_token() == "APP-RT"
+
+    web_store = TokenStore(mode="apigee", path=tmp_path / "b.json")
+    web_store.apigee = ApigeeTokens(access_token="b", expires_at=2.0, refresh_token="WEB-RT")
+    assert _App(web_store)._current_refresh_token() == "WEB-RT"
