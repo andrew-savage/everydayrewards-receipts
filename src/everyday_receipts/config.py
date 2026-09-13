@@ -8,14 +8,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-# Public identifiers baked into the Everyday Rewards web app (www.everyday.com.au).
-DEFAULT_REWARDS_CLIENT_ID = "8h41mMOiDULmlLT28xKSv5ITpp3XBRvH"
+# Public identifiers baked into the Everyday Rewards apps.
+DEFAULT_REWARDS_CLIENT_ID = "8h41mMOiDULmlLT28xKSv5ITpp3XBRvH"  # web API client
+DEFAULT_PARTNER_CLIENT_ID = "eAjOrRlfHIyqpK1KVX8UlmmCFvfmoGXY"  # token-exchange client
 DEFAULT_LOGIN_REDIRECT_URI = "https://www.everyday.com.au/callback"
 DEFAULT_API_BASE = "https://api.everyday.com.au"
-# Login/refresh routes only respond on the direct apigee gateway; the Akamai-fronted
-# api.everyday.com.au / api.woolworthsrewards.com.au aliases hang on /wx/v2/security/refreshToken.
+# Login/refresh routes for the (web) backend only respond on the direct apigee gateway.
 DEFAULT_SECURITY_BASE = "https://apigee-prod.api-wr.com"
 DEFAULT_GRAPHQL_URL = "https://apigee-prod.api-wr.com/wx/v1/bff/graphql"
+
+# The Everyday Rewards mobile app is a standard Auth0 native client. Its long-lived
+# refresh token is the only route to unattended operation; the token it mints is
+# exchanged for an API bearer via the partner token-exchange endpoint.
+DEFAULT_AUTH0_DOMAIN = "https://auth.everyday.com.au"
+DEFAULT_AUTH0_APP_CLIENT_ID = "NIG5ul5ubHYy61KoFRNBspUSo1scgDwx"
+DEFAULT_AUTH0_AUDIENCE = "https://www.woolworthsrewards.com.au/auth/"
+DEFAULT_AUTH0_SCOPE = "openid offline_access"
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -48,16 +57,23 @@ class Settings:
     max_pages: int
     filename_template: str
     subdir_by_partner: bool
+    feed_mode: str  # "rest" (default) or "graphql"
     api_base: str
     security_base: str
     graphql_url: str
     rewards_client_id: str
+    partner_client_id: str
     login_redirect_uri: str
+    auth0_domain: str
+    auth0_app_client_id: str
+    auth0_audience: str
+    auth0_scope: str
     apigee_refresh_body_key: str
     user_agent: str
     request_timeout: float
     static_access_token: str | None
     auth_status_json: str | None
+    app_token_json: str | None
     log_level: str
 
     @classmethod
@@ -86,16 +102,23 @@ class Settings:
             max_pages=int(get("EDR_MAX_PAGES", "60")),
             filename_template=get("EDR_FILENAME_TEMPLATE", DEFAULT_FILENAME_TEMPLATE),
             subdir_by_partner=parse_bool(get("EDR_SUBDIR_BY_PARTNER", "false")),
+            feed_mode=get("EDR_FEED_MODE", "rest").lower(),
             api_base=get("EDR_API_BASE", DEFAULT_API_BASE).rstrip("/"),
             security_base=get("EDR_SECURITY_BASE", DEFAULT_SECURITY_BASE).rstrip("/"),
             graphql_url=get("EDR_GRAPHQL_URL", DEFAULT_GRAPHQL_URL),
             rewards_client_id=get("EDR_REWARDS_CLIENT_ID", DEFAULT_REWARDS_CLIENT_ID),
+            partner_client_id=get("EDR_PARTNER_CLIENT_ID", DEFAULT_PARTNER_CLIENT_ID),
             login_redirect_uri=get("EDR_LOGIN_REDIRECT_URI", DEFAULT_LOGIN_REDIRECT_URI),
+            auth0_domain=get("EDR_AUTH0_DOMAIN", DEFAULT_AUTH0_DOMAIN).rstrip("/"),
+            auth0_app_client_id=get("EDR_AUTH0_APP_CLIENT_ID", DEFAULT_AUTH0_APP_CLIENT_ID),
+            auth0_audience=get("EDR_AUTH0_AUDIENCE", DEFAULT_AUTH0_AUDIENCE),
+            auth0_scope=get("EDR_AUTH0_SCOPE", DEFAULT_AUTH0_SCOPE),
             apigee_refresh_body_key=get("EDR_APIGEE_REFRESH_BODY_KEY", "refresh_token"),
             user_agent=get("EDR_USER_AGENT", DEFAULT_USER_AGENT),
             request_timeout=float(get("EDR_REQUEST_TIMEOUT", "30")),
             static_access_token=e.get("EDR_ACCESS_TOKEN") or None,
             auth_status_json=e.get("EDR_AUTH_STATUS_JSON") or None,
+            app_token_json=e.get("EDR_APP_TOKEN_JSON") or None,
             log_level=get("EDR_LOG_LEVEL", "INFO").upper(),
         )
 

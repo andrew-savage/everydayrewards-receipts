@@ -54,13 +54,13 @@ class EverydayRewardsClient:
         headers["Authorization"] = f"Bearer {bearer}"
         return headers
 
-    def _post(self, url: str, payload: dict[str, Any]) -> httpx.Response:
+    def _request(self, method: str, url: str, payload: dict[str, Any] | None = None) -> httpx.Response:
         refreshed = False
         last_error: Exception | None = None
         for attempt in range(self.RETRIES):
             bearer = self.auth.get_bearer()
             try:
-                resp = self.http.post(url, json=payload, headers=self._headers(bearer))
+                resp = self.http.request(method, url, json=payload, headers=self._headers(bearer))
             except httpx.HTTPError as exc:
                 last_error = exc
                 log.warning("network error calling %s (attempt %d): %s", url, attempt + 1, exc)
@@ -81,6 +81,9 @@ class EverydayRewardsClient:
             return resp
         raise ApiError(f"giving up on {url}: {last_error}") from last_error
 
+    def _post(self, url: str, payload: dict[str, Any]) -> httpx.Response:
+        return self._request("POST", url, payload)
+
     def graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
         resp = self._post(self.settings.graphql_url, {"query": query, "variables": variables})
         try:
@@ -97,7 +100,41 @@ class EverydayRewardsClient:
             log.warning("GraphQL returned partial data with errors: %s", errors)
         return data or {}
 
-    # -- activity feed ----------------------------------------------------------
+    # -- feed (dispatch) --------------------------------------------------------
+
+    def iter_receipt_pages(self) -> Iterator[list[ActivityItem]]:
+        """Yield pages of receipt-bearing items, newest first, per the configured feed mode."""
+        if self.settings.feed_mode == "graphql":
+            yield from self.iter_activity_pages()
+        else:
+            yield from self.iter_transaction_pages()
+
+    # -- REST transactions list (works with any valid bearer) -------------------
+
+    def iter_transaction_pages(self) -> Iterator[list[ActivityItem]]:
+        """Page through /wx/v1/rewards/member/ereceipts/transactions/list until it is empty."""
+        base = f"{self.settings.api_base}/wx/v1/rewards/member/ereceipts/transactions/list"
+        page = 1
+        while page <= self.settings.max_pages:
+            resp = self._request("GET", f"{base}?page={page}")
+            try:
+                body = resp.json()
+            except ValueError as exc:
+                raise ApiError(f"transactions/list returned non-JSON ({resp.status_code})", resp.status_code, resp.text[:300]) from exc
+            if resp.status_code >= 400:
+                raise ApiError(f"transactions/list returned {resp.status_code}", resp.status_code, body)
+            rows = body.get("data") if isinstance(body, dict) else body
+            if not isinstance(rows, list):
+                raise ApiError("transactions/list did not return a list", resp.status_code, body)
+            if not rows:
+                break
+            items = [ActivityItem.from_rest_list(row) for row in rows if isinstance(row, dict)]
+            yield [item for item in items if item.receipt_id]
+            page += 1
+        else:
+            log.warning("stopped after %d pages (EDR_MAX_PAGES); more history may remain", self.settings.max_pages)
+
+    # -- GraphQL activity feed (web session) ------------------------------------
 
     def iter_activity_pages(self) -> Iterator[list[ActivityItem]]:
         """Yield the activity feed one page at a time, newest first."""
@@ -124,6 +161,8 @@ class EverydayRewardsClient:
     # -- receipts ---------------------------------------------------------------
 
     def get_receipt_details(self, item: ActivityItem) -> ReceiptDetails:
+        if self.settings.feed_mode != "graphql":
+            return self._receipt_details_rest(item)
         try:
             data = self.graphql(queries.ACTIVITY_DETAILS, {"id": item.details_id})
         except GraphQLError as exc:

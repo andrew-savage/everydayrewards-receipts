@@ -4,27 +4,27 @@ Pulls your Everyday Rewards (Woolworths, BWS, Big W, Woolworths Online) e-receip
 into a folder, so paperless-ngx can consume them. Runs unattended in Docker, checks for new
 receipts every few hours, and never writes the same receipt twice.
 
-There is no official API or email option for e-receipts. This uses the same GraphQL and
-REST endpoints the Everyday Rewards website calls, after a one-time browser login.
+There is no official API or email option for e-receipts. This uses the same endpoints the
+Everyday Rewards mobile app and website call, after a one-time token capture.
 
 ## How it works
 
-1. **One-time login.** Either sign in on the Everyday Rewards website as usual and hand the
-   app the session your browser stored (`import-session`), or let the app drive the same
-   Auth0 login the website uses (`login`). The app never sees your password. It keeps the
-   resulting bearer and refresh token in `data/tokens.json` (mode `0600`).
-2. **Polling.** Every `EDR_POLL_INTERVAL` (default 6 h) it walks the activity feed, newest
-   first, and stops at the first page where every receipt is already saved.
-3. **Download.** For each new receipt it fetches the receipt details (store, total, itemised
-   lines) and the PDF, then writes the PDF atomically into the output folder as
-   `2026-09-06 Woolworths Ashfield $90.86 [3f2a9c1e].pdf`. An itemised JSON copy goes to
+1. **One-time token.** You capture the Everyday Rewards **mobile app's** Auth0 login once,
+   with an HTTPS proxy, and import it (`import-app-token`). The app is a standard Auth0
+   native client, so its refresh token is long-lived. The app never sees your password. The
+   token is stored in `data/tokens.json` (mode `0600`).
+2. **Refresh chain.** To call the API, the service renews the app's Auth0 access token at
+   `auth.everyday.com.au/oauth/token`, then swaps that token for a short-lived API bearer at
+   the website's token-exchange endpoint. Both happen automatically; you never touch it again.
+3. **Polling.** Every `EDR_POLL_INTERVAL` (default 6 h) it pages through your receipts list,
+   newest first, and stops at the first page where every receipt is already saved.
+4. **Download.** For each new receipt it fetches the details (store, total, itemised lines)
+   and the PDF, then writes the PDF atomically into the output folder as
+   `2026-09-13 Woolworths Ivanhoe $44.40 [3f2a9c1e].pdf`. An itemised JSON copy goes to
    `data/json/` (not into the consume folder).
-4. **Refresh.** API bearer tokens last about an hour. A **mobile-app** session also carries
-   a refresh token good for ~14 months, which the service uses to mint fresh bearers
-   unattended. A **browser** session's refresh token lasts only ~2 hours and cannot be
-   renewed (see [Session lifetime](#session-lifetime-important)), so it is useful for a
-   one-off backfill but not for running unattended. If renewal stops, the health check turns
-   unhealthy and `data/NEEDS_LOGIN` explains why.
+
+If the app's refresh token is ever rejected, the health check turns unhealthy and
+`data/NEEDS_LOGIN` explains why; you capture a fresh token the same way.
 
 ## Quick start
 
@@ -32,88 +32,60 @@ REST endpoints the Everyday Rewards website calls, after a one-time browser logi
 cp .env.example .env            # edit RECEIPTS_DIR / DATA_DIR / PUID / PGID
 mkdir -p receipts data
 docker compose build
-docker compose run --rm everyday-receipts import-session   # one-time, interactive (see below)
-docker compose run --rm everyday-receipts refresh          # proves unattended renewal works
+docker compose run --rm everyday-receipts import-app-token   # one-time, interactive (see below)
+docker compose run --rm everyday-receipts refresh            # proves unattended renewal works
 docker compose up -d
 docker compose logs -f
 ```
 
-### Getting a session (one-time)
+### Capturing the app token (one-time)
 
-**Option A - import the browser session (quickest, for the backfill).** Sign in at
-https://www.everyday.com.au in any browser. Open the developer console (F12, or Cmd-Opt-J on
-a Mac) and run:
+The mobile app logs in through Auth0. You capture that login once with an HTTPS debugging
+proxy, then paste the token response.
 
-```js
-localStorage.getItem('authStatusData')
-```
+1. Install [HTTP Toolkit](https://httptoolkit.com/) (free) on a computer, set your phone to
+   use it as a proxy, and trust its CA certificate. HTTP Toolkit's phone setup walks you
+   through both.
+2. Force a fresh login in the Everyday Rewards app: **log out and back in** (or reinstall).
+   A launch of an already-logged-in app also refreshes, but a full login is the surest way to
+   see the token.
+3. In the proxy, filter for `auth.everyday.com.au` and find the `POST /oauth/token` request.
+   Its JSON **response** looks like:
 
-It prints a small JSON blob holding the site's bearer and refresh token. Select and copy
-exactly what it printed (the escaped `\"` form, surrounding quotes and Safari's trailing
-` = $1` are all fine; the importer unwraps them). Run
-`docker compose run --rm everyday-receipts import-session`, paste it, press Enter. The app
-verifies it by loading your activity feed and prints how long the refresh token lasts.
+   ```json
+   { "access_token": "eyJ...", "refresh_token": "...", "id_token": "eyJ...",
+     "scope": "openid offline_access", "expires_in": 86400, "token_type": "Bearer" }
+   ```
 
-Because the web refresh token lives only about two hours, keep the container running: it
-renews the session every hour or so. If it is stopped for longer than the refresh token's
-lifetime, run `import-session` again.
+4. Copy that whole response object. Run
+   `docker compose run --rm everyday-receipts import-app-token`, paste it, press Enter.
 
-**Option B - `login`.** `docker compose run --rm everyday-receipts login` asks the
-Everyday Rewards backend for its Auth0 login URL (the same one the "Log in" button uses)
-and prints it. Sign in, and you land on `https://www.everyday.com.au/callback?code=...`.
-Paste that **full address** back into the terminal; the app swaps the code for tokens
-through the site's own token endpoint.
+   The app validates it (loads your receipts) and prints the session summary. Or, if you only
+   have the refresh token, `import-app-token --refresh-token 'THE_VALUE'`.
 
-The catch: the callback page runs JavaScript that uses the code itself within a second.
-Block JavaScript for `www.everyday.com.au` in your browser *before* signing in (Chrome:
-Settings → Privacy and security → Site settings → JavaScript → *Not allowed* → add
-`www.everyday.com.au`; remove it afterwards). The Auth0 page is on another host and keeps
-working. `login --redirect-uri http://localhost:8765/callback --listen 0.0.0.0:8765`
-would avoid all that, but Woolworths' Auth0 client only allows its own callback URL; the
-command checks and tells you up front if a redirect URI is rejected.
+Then run `docker compose run --rm everyday-receipts refresh` to confirm the unattended chain
+works, and `docker compose up -d`.
 
-Whichever option you use, finish with `everyday-receipts refresh`. It forces a token renewal
-and confirms the unattended path works before you rely on it.
+### One-off backfill without a proxy (optional)
+
+If you just want to import your back-catalogue quickly and can't set up a proxy yet, a browser
+session works for a single run but **cannot** run unattended (see below). Sign in at
+https://www.everyday.com.au, open the developer console (F12 / Cmd-Opt-J), run
+`localStorage.getItem('authStatusData')`, copy what it prints, and
+`docker compose run --rm everyday-receipts import-session` then paste. Run `once` to pull the
+history, but expect `LOGIN REQUIRED` within the hour; switch to an app token for ongoing use.
 
 ## Session lifetime (important)
 
-There are two kinds of session, and they behave very differently:
-
-| Source | Refresh token lasts | Good for |
+| Source | Lasts | Good for |
 | --- | --- | --- |
-| Browser (`import-session` of `authStatusData`) | ~2 hours, **not renewable** | one-off backfill of your history |
-| Mobile app (captured refresh token) | ~14 months, renewed automatically | running unattended |
+| Mobile app token (`import-app-token`) | long-lived, renewed automatically | running unattended |
+| Browser session (`import-session`) | ~1 hour, **not renewable** | a single backfill |
 
-The Everyday Rewards **website never refreshes its own session** - it makes you log in again
-when the token expires - and its refresh token is rejected by the refresh endpoint. So a
-browser session cannot be kept alive: after about an hour the container will report
-`LOGIN REQUIRED`. That is fine for the initial import of your back-catalogue, which finishes
-in minutes.
-
-For unattended running you need the **mobile app's** long-lived refresh token. You capture it
-once with an HTTPS debugging proxy on your phone:
-
-1. Install [HTTP Toolkit](https://httptoolkit.com/) (free) on a computer, or mitmproxy, and
-   set your phone to use it as a proxy with its CA certificate trusted. HTTP Toolkit's
-   Android/iOS setup walks you through both.
-2. Open the Everyday Rewards app and log in (or just open it if already logged in - it
-   refreshes on launch).
-3. In the proxy, find a request to `api-wr.com` or `woolworthsrewards.com.au` whose JSON
-   response contains `"refresh"` and `"refreshExpiredInSeconds"` (a big number like
-   `38879999`). Copy the `refresh` value, and note `refreshExpiredInSeconds`.
-4. Import it:
-
-   ```bash
-   docker compose run --rm everyday-receipts import-session \
-     --refresh-token 'PASTE_THE_REFRESH_VALUE' --refresh-lifetime 38879999
-   ```
-
-   The app mints a bearer from it immediately and prints the lifetime. Then
-   `docker compose up -d` and it runs on its own, renewing every hour or so for ~14 months.
-
-If the mobile refresh token is ever rejected, capture a fresh one the same way. If the
-capture also includes the request's `client_id` header and it differs from the default, set
-`EDR_REWARDS_CLIENT_ID` to match.
+The Everyday Rewards **website never refreshes its own session** - it logs you in again when
+the token expires, and its refresh endpoint rejects the browser refresh token. The mobile app,
+by contrast, is a normal Auth0 native client whose refresh token the service can use directly.
+That is why unattended running needs the app token.
 
 ## paperless-ngx setup
 
@@ -122,7 +94,7 @@ Point paperless-ngx's consume directory at the receipts folder (over NFS) and se
 | paperless-ngx setting | Value | Why |
 | --- | --- | --- |
 | `PAPERLESS_CONSUMER_POLLING` | `30` | inotify does not fire for files written on another host over NFS; polling does. |
-| `PAPERLESS_FILENAME_DATE_ORDER` | `YMD` | Filenames start with `2026-09-06`, so paperless uses the transaction date as the document date. |
+| `PAPERLESS_FILENAME_DATE_ORDER` | `YMD` | Filenames start with `2026-09-13`, so paperless uses the transaction date as the document date. |
 | `PAPERLESS_CONSUMER_RECURSIVE` / `PAPERLESS_CONSUMER_SUBDIRS_AS_TAGS` | `true` | Only if you enable `EDR_SUBDIR_BY_PARTNER` to get a `Woolworths` / `BWS` / `Big W` tag per receipt. |
 
 Handy paperless matching rules: a correspondent **Woolworths** with *auto* matching, a
@@ -156,18 +128,17 @@ All settings are environment variables (see `.env.example`).
 | `EDR_MAX_PAGES` | `60` | Safety cap on feed pages per run. |
 | `EDR_FILENAME_TEMPLATE` | `{date} {partner} {store} {amount} [{short_id}]` | Fields: `date`, `partner`, `store`, `amount`, `short_id`, `receipt_id`, `id`. |
 | `EDR_SUBDIR_BY_PARTNER` | `false` | Write into `Woolworths/`, `BWS/`, ... sub-folders. |
+| `EDR_FEED_MODE` | `rest` | `rest` (works with an app token) or `graphql` (web session only). |
 | `EDR_LOG_LEVEL` | `INFO` | `DEBUG` logs every request. |
-| `EDR_APIGEE_REFRESH_BODY_KEY` | `refresh_token` | Preferred JSON key for the refresh call; the other spelling is tried automatically and the working one remembered. |
-| `EDR_LOGIN_REDIRECT_URI` | `https://www.everyday.com.au/callback` | Redirect URI requested by `login`. |
-| `EDR_ACCESS_TOKEN` | – | Static bearer for quick testing only (dies after ~30 min). |
-| `EDR_AUTH_STATUS_JSON` | – | Non-interactive equivalent of `import-session`, used only if no session is stored yet. |
+| `EDR_APP_TOKEN_JSON` | – | Non-interactive equivalent of `import-app-token`: the Auth0 token JSON. Used only if no session is stored yet. |
+| `EDR_AUTH_STATUS_JSON` | – | Non-interactive equivalent of `import-session` (backfill). |
+| `EDR_ACCESS_TOKEN` | – | Static bearer for quick testing only (dies after ~20 min). |
 
-Advanced overrides exist for the API hosts and client identifier (`EDR_API_BASE`,
-`EDR_SECURITY_BASE`, `EDR_GRAPHQL_URL`, `EDR_REWARDS_CLIENT_ID`, `EDR_USER_AGENT`) in case
-Woolworths changes them; defaults are the values the public web app ships with.
-`EDR_SECURITY_BASE` (default `https://apigee-prod.api-wr.com`) is the host for login and
-token refresh: those routes respond only on the direct apigee gateway, not on the
-Akamai-fronted `api.everyday.com.au` alias, where they hang.
+Advanced overrides exist for the hosts and client identifiers in case Woolworths changes
+them; defaults are the values the apps ship with: `EDR_API_BASE` (token exchange + receipts),
+`EDR_AUTH0_DOMAIN`, `EDR_AUTH0_APP_CLIENT_ID`, `EDR_AUTH0_AUDIENCE`, `EDR_AUTH0_SCOPE`,
+`EDR_PARTNER_CLIENT_ID` (token-exchange client), `EDR_REWARDS_CLIENT_ID` (API client),
+`EDR_SECURITY_BASE` and `EDR_GRAPHQL_URL` (the web login/GraphQL gateway), `EDR_USER_AGENT`.
 
 ## Operating it
 
@@ -180,36 +151,38 @@ docker compose logs -f                                            # what it is d
 * **Health.** `docker ps` shows `(healthy)` once a sync has succeeded within the last
   `2 × EDR_POLL_INTERVAL + 10 min` and no login is pending.
 * **Re-login.** If `data/NEEDS_LOGIN` appears (health `unhealthy`, log line `LOGIN REQUIRED`),
-  run `import-session` or `login` again. Nothing else needs to change.
-* **Check renewal.** `docker compose run --rm everyday-receipts refresh` forces a token
-  refresh and reports the result.
+  capture a fresh app token and run `import-app-token` again. Nothing else changes.
+* **Check renewal.** `docker compose run --rm everyday-receipts refresh` forces the full
+  refresh chain and reports the result.
 * **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by receipt id) or
   delete `state.json` entirely; existing PDFs are never overwritten, so re-scans are safe.
 * **Backfill.** The first run fetches everything Everyday Rewards still holds (close to three
   years in practice, several hundred receipts). Fuel and points-only activities have no
   e-receipt and are skipped.
 
-## Known unknowns
+## How the auth actually works
 
-This talks to an unofficial API, so a few things can only be confirmed with a real session:
+Established by reading the apps' traffic (2026-09):
 
-* **Web sessions cannot be renewed.** Confirmed 2026-09: neither the current site nor the
-  old one refreshes its session (both log out on expiry), and the refresh endpoint rejects a
-  browser refresh token (`1013 Invalid Refresh Token`). Unattended running therefore needs a
-  mobile-app token (see [Session lifetime](#session-lifetime-important)).
-* **Mobile token endpoint details.** The mobile refresh token is expected to work with
-  `/wx/v2/security/refreshToken` on the apigee gateway (that is the app's own endpoint), but
-  the exact `client_id` header the app uses was not captured; override `EDR_REWARDS_CLIENT_ID`
-  if a captured token is rejected with the default.
-* **Refresh request body.** The website exposes `/wx/v2/security/refreshToken` but never
-  calls it, so the JSON key is inferred. The app tries `refresh_token` then `refreshToken`
-  and remembers whichever the endpoint accepts; a rejected token (401/403) means a re-login.
-* **Auth0 client.** The site's JavaScript also carries a newer Auth0 SPA client, but Auth0
-  rejects it with *Callback URL mismatch* for the production callback, so the app uses the
-  backend-mediated flow the live site uses.
+* The mobile app is an Auth0 native client (`client_id NIG5ul5ubHYy61KoFRNBspUSo1scgDwx`,
+  audience `https://www.woolworthsrewards.com.au/auth/`, scope `openid offline_access`). It
+  refreshes at `auth.everyday.com.au/oauth/token` with `grant_type=refresh_token`.
+* The resulting Auth0 access token (a JWT) is exchanged for an API bearer at
+  `POST api.everyday.com.au/wx/v1/rewardspartner/secure/token-exchange` (client
+  `eAjOrRlfHIyqpK1KVX8UlmmCFvfmoGXY`), which returns a ~20-minute bearer.
+* That bearer drives the plain REST receipt endpoints on `api.everyday.com.au`
+  (`.../ereceipts/transactions/list`, `.../details`, `.../details/download`) with client
+  `8h41mMOiDULmlLT28xKSv5ITpp3XBRvH`. These have no bot protection.
+* The mobile GraphQL host (`prod.mobile-api.woolworths.com.au`) is behind Akamai and is not
+  used; the REST endpoints above return the same receipts.
+* The website's own session cannot be refreshed, so a browser import is backfill-only.
 
-Using the site's private API may be against Woolworths' terms; the request volume here is
-tiny (one feed page and a few downloads every 6 hours), but use at your own risk.
+Auth0 may rotate the refresh token on each refresh; the service persists the new one
+immediately. If Auth0 enforces an absolute lifetime, a re-capture will eventually be needed;
+`status` and the logs will say so.
+
+Using these private APIs may be against Woolworths' terms; the request volume here is tiny
+(one list page and a few downloads every 6 hours), but use at your own risk.
 
 ## Development
 
@@ -217,18 +190,17 @@ tiny (one feed page and a few downloads every 6 hours), but use at your own risk
 uv sync                      # creates .venv with dev deps
 uv run pytest                # unit tests (all HTTP is mocked)
 uv run everyday-receipts --help
-EDR_DATA_DIR=./data EDR_OUTPUT_DIR=./receipts uv run everyday-receipts login
 ```
 
-Layout: `config.py` (env settings), `auth.py` (login flow, token store, refresh),
-`api.py` + `queries.py` (GraphQL/REST client), `models.py` (feed items, receipt details),
-`naming.py` (dates and filenames), `sync.py` (dedupe + atomic writes), `cli.py`.
+Layout: `config.py` (env settings), `auth.py` (Auth0 refresh + token exchange, token store),
+`api.py` (REST + GraphQL client), `models.py` (list items, receipt details), `naming.py`
+(dates and filenames), `sync.py` (dedupe + atomic writes), `cli.py`.
 
 ## Credits
 
 Endpoint knowledge builds on [T-Fowl/everyday-rewards-receipts](https://github.com/T-Fowl/everyday-rewards-receipts)
-and [ekutilov/wooliesR](https://github.com/ekutilov/wooliesR); the login-url and token
-endpoints were taken from the public JavaScript of www.everyday.com.au.
+and [ekutilov/wooliesR](https://github.com/ekutilov/wooliesR); the Auth0 native-client flow and
+token-exchange endpoint were established from the app's and website's own traffic.
 
 ## License
 

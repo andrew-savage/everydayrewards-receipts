@@ -29,6 +29,42 @@ PARTNER_NAMES = {
 
 _TX_DATETIME_RE = re.compile(r"(\d{1,2}):(\d{2})\D{1,6}(\d{1,2})/(\d{1,2})/(\d{4})")
 _TX_DATE_RE = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+_STORE_NUMBER_PREFIX = re.compile(r"^\d{2,6}\s+")
+
+# Best-effort partner from the REST list's `banner` code / `receiptType`.
+_BANNER_PARTNERS = (
+    ("BWS", "BWS"),
+    ("BIGW", "Big W"),
+    ("BIG_W", "Big W"),
+    ("METRO", "Woolworths Metro"),
+    ("AMPOL", "Ampol"),
+    ("EG", "EG Ampol"),
+    ("CALTEX", "Caltex Woolworths"),
+)
+
+
+def _clean_store(name: str | None) -> str | None:
+    """Drop a leading store number, e.g. '3197 Ivanhoe' -> 'Ivanhoe'."""
+    if not name:
+        return name
+    return _STORE_NUMBER_PREFIX.sub("", name).strip() or name
+
+
+def _parse_rest_datetime(item: dict[str, Any]) -> datetime | None:
+    for key, fmt in (("transactionDate", "%Y-%m-%d %H:%M:%S"), ("date", "%d/%m/%Y")):
+        value = item.get(key)
+        if value:
+            try:
+                return datetime.strptime(str(value), fmt)
+            except ValueError:
+                pass
+    iso = item.get("receiptDate")
+    if iso:
+        try:
+            return datetime.fromisoformat(str(iso))
+        except ValueError:
+            return None
+    return None
 
 
 @dataclass
@@ -45,7 +81,42 @@ class ActivityItem:
     origin: str | None
     amount: str | None
     group_title: str | None
+    rest_datetime: datetime | None = None
+    rest_partner: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_rest_list(cls, item: dict[str, Any]) -> "ActivityItem":
+        """Build from one entry of /wx/v1/rewards/member/ereceipts/transactions/list."""
+        store = _clean_store(item.get("storeName"))
+        amount = item.get("total") or item.get("totalSpent")
+        receipt_type = (item.get("receiptType") or "").strip().lower()
+        banner = (item.get("banner") or "").upper()
+        partner = "Woolworths"
+        for prefix, name in _BANNER_PARTNERS:
+            if banner.startswith(prefix):
+                partner = name
+                break
+        else:
+            if receipt_type == "online":
+                partner = "Woolworths Online"
+        return cls(
+            id=str(item.get("EEReferenceNumber") or item.get("basketKey") or item.get("receiptKey") or ""),
+            display_date=item.get("date"),
+            description=f"{amount} at {store}" if amount and store else (store or item.get("date")),
+            icon=None,
+            icon_url=None,
+            activity_details_id=None,
+            receipt_id=item.get("receiptKey") or None,
+            receipt_source=receipt_type or None,
+            transaction_type="purchase",
+            origin=store,
+            amount=amount,
+            group_title=None,
+            rest_datetime=_parse_rest_datetime(item),
+            rest_partner=partner,
+            raw=item,
+        )
 
     @classmethod
     def from_graphql(cls, item: dict[str, Any], group_title: str | None) -> "ActivityItem":
@@ -87,6 +158,8 @@ class ActivityItem:
 
     @property
     def partner(self) -> str:
+        if self.rest_partner:
+            return self.rest_partner
         key = (self.icon or "").strip().lower()
         if key in ("", "unknown_partner") and self.icon_url:
             base = self.icon_url.rsplit("/", 1)[-1].lower()

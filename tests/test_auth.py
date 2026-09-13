@@ -10,11 +10,13 @@ import pytest
 
 from everyday_receipts.auth import (
     ApigeeTokens,
+    Auth0Tokens,
     AuthError,
     AuthManager,
     LoginAttempt,
     ReloginRequired,
     TokenStore,
+    looks_like_auth0_token,
     make_state,
     parse_redirect,
 )
@@ -264,8 +266,16 @@ def test_token_store_roundtrip_and_legacy_file(tmp_path):
     loaded.clear()
     assert TokenStore.load(path).mode == "none"
 
-    # A file written by the earlier Auth0-based version still loads.
-    path.write_text(json.dumps({"mode": "auth0", "auth0": {"access_token": "x"}, "apigee": {"access_token": "b", "expires_at": 1.0}}))
+    # An app-token (auth0) session round-trips too.
+    store = TokenStore(mode="auth0", path=path)
+    store.auth0 = Auth0Tokens(refresh_token="rt", access_token="jwt", expires_at=9.0)
+    store.apigee = ApigeeTokens(access_token="bearer", expires_at=10.0)
+    store.save()
+    loaded = TokenStore.load(path)
+    assert loaded.mode == "auth0" and loaded.auth0 == store.auth0 and loaded.apigee == store.apigee
+
+    # A file with an unknown mode but apigee tokens still loads as apigee.
+    path.write_text(json.dumps({"mode": "weird", "apigee": {"access_token": "b", "expires_at": 1.0}}))
     legacy = TokenStore.load(path)
     assert legacy.mode == "apigee" and legacy.apigee.access_token == "b"
 
@@ -408,3 +418,141 @@ def test_import_tokens_without_access_no_bearer_header(settings):
     auth.import_tokens(refresh_token="R", access_token=None, refresh_lifetime=38879999)
     assert store.apigee.access_token == "NEW"
     assert seen["auth_present"] is False
+
+
+# --------------------------------------------------------------------------- auth0 app-token flow
+
+MOBILE_JWT_HEADER = "eyJhbGciOiJSUzI1NiJ9"
+
+
+def _make_jwt(exp: int, nonce: int = 0) -> str:
+    import base64 as _b64
+
+    payload = _b64.urlsafe_b64encode(json.dumps({"exp": exp, "n": nonce}).encode()).rstrip(b"=").decode()
+    return f"{MOBILE_JWT_HEADER}.{payload}.{'s' * 90}"  # long enough to look like a real JWT
+
+
+def _auth0_handler(state: dict, clock):
+    """Mocks Auth0 /oauth/token and the partner token-exchange endpoint."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.url.host == "auth.everyday.com.au" and path == "/oauth/token":
+            body = json.loads(request.content)
+            state.setdefault("auth0_calls", []).append(body)
+            assert body["grant_type"] == "refresh_token"
+            assert body["client_id"] == "NIG5ul5ubHYy61KoFRNBspUSo1scgDwx"
+            if body["refresh_token"] in state.get("dead_refresh", ()):
+                return httpx.Response(403, json={"error": "invalid_grant", "error_description": "Unknown or invalid refresh token."})
+            n = len(state["auth0_calls"])
+            resp = {"access_token": _make_jwt(int(clock()) + 86400, nonce=n), "expires_in": 86400, "token_type": "Bearer", "scope": "openid offline_access"}
+            if state.get("rotate", True):
+                resp["refresh_token"] = f"RT{n + 1}"
+            return httpx.Response(200, json=resp)
+        if path == "/wx/v1/rewardspartner/secure/token-exchange":
+            assert request.headers["client_id"] == "eAjOrRlfHIyqpK1KVX8UlmmCFvfmoGXY"
+            jwt = json.loads(request.content)["access_token"]
+            state.setdefault("exchanges", []).append(jwt)
+            if jwt in state.get("reject_jwt", ()):
+                return httpx.Response(401, json={"errors": [{"code": "1007", "message": "Access Token Invalid"}]})
+            n = len(state["exchanges"])
+            return httpx.Response(201, json={"data": {"accessToken": f"BEARER{n}", "accessTokenExpiresIn": 1199}})
+        return httpx.Response(404, text="unexpected " + str(request.url))
+
+    return handler
+
+
+def test_looks_like_auth0_token():
+    assert looks_like_auth0_token({"refresh_token": "r", "access_token": _make_jwt(1)}) is True
+    assert looks_like_auth0_token({"refresh_token": "r", "id_token": "x", "access_token": "opaque"}) is True
+    assert looks_like_auth0_token({"access_token": "opaque28chars", "refresh_token": "r"}) is False  # not a JWT, no id_token
+    assert looks_like_auth0_token({"access_token": "A", "expires_in": 1800}) is False
+
+
+def test_import_app_token_with_jwt_then_reuse_and_refresh(settings):
+    st: dict = {}
+    now = {"t": 1_000_000.0}
+    http = make_client(_auth0_handler(st, lambda: now["t"]))
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+
+    auth.import_app_token(refresh_token="RT0", access_token=_make_jwt(int(now["t"]) + 86400))
+    assert store.mode == "auth0"
+    assert store.auth0.refresh_token == "RT0"  # JWT supplied, so no Auth0 refresh yet
+    assert st.get("auth0_calls") is None
+    assert store.apigee.access_token == "BEARER1"  # one exchange happened
+
+    # Fresh bearer: no calls.
+    before = len(st["exchanges"])
+    assert auth.get_bearer() == "BEARER1"
+    assert len(st["exchanges"]) == before
+
+    # Bearer expired, JWT still valid: only a new exchange, no Auth0 refresh.
+    now["t"] += 1200
+    assert auth.get_bearer() == "BEARER2"
+    assert st.get("auth0_calls") is None
+    assert st["exchanges"] == [store.auth0.access_token, store.auth0.access_token]
+
+    # JWT expired: Auth0 refresh (rotates RT), then exchange.
+    now["t"] += 86400
+    assert auth.get_bearer() == "BEARER3"
+    assert len(st["auth0_calls"]) == 1
+    assert store.auth0.refresh_token == "RT2"
+    assert TokenStore.load(settings.token_path).auth0.refresh_token == "RT2"
+
+
+def test_import_app_token_refresh_only_mints_immediately(settings):
+    st: dict = {}
+    now = {"t": 500.0}
+    http = make_client(_auth0_handler(st, lambda: now["t"]))
+    store = TokenStore(path=settings.token_path)
+    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+    auth.import_app_token(refresh_token="RT0")  # no JWT: must refresh Auth0 first
+    assert len(st["auth0_calls"]) == 1
+    assert store.apigee.access_token == "BEARER1"
+    assert store.auth0.access_token.startswith(MOBILE_JWT_HEADER)
+
+
+def test_import_auth0_response_from_pasted_json(settings):
+    st: dict = {}
+    now = {"t": 500.0}
+    http = make_client(_auth0_handler(st, lambda: now["t"]))
+    auth = AuthManager(settings, TokenStore(path=settings.token_path), http, clock=lambda: now["t"])
+    auth.import_auth0_response({"access_token": _make_jwt(int(now["t"]) + 86400), "refresh_token": "RTx", "expires_in": 86400})
+    assert auth.get_bearer() == "BEARER1"
+
+
+def test_auth0_dead_refresh_token_requires_relogin(settings):
+    st: dict = {"dead_refresh": {"RT0"}}
+    now = {"t": 500.0}
+    http = make_client(_auth0_handler(st, lambda: now["t"]))
+    store = TokenStore(mode="auth0", path=settings.token_path)
+    store.auth0 = Auth0Tokens(refresh_token="RT0", access_token="", expires_at=0.0)
+    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+    with pytest.raises(ReloginRequired):
+        auth.get_bearer()
+
+
+def test_auth0_exchange_rejected_jwt_triggers_one_refresh_retry(settings):
+    st: dict = {}
+    now = {"t": 500.0}
+    stale = _make_jwt(int(now["t"]) + 86400)
+    st["reject_jwt"] = {stale}
+    http = make_client(_auth0_handler(st, lambda: now["t"]))
+    store = TokenStore(mode="auth0", path=settings.token_path)
+    store.auth0 = Auth0Tokens(refresh_token="RT0", access_token=stale, expires_at=now["t"] + 86400)
+    auth = AuthManager(settings, store, http, clock=lambda: now["t"])
+    # First exchange (stale JWT) 401s -> one Auth0 refresh -> exchange the fresh JWT succeeds.
+    assert auth.get_bearer().startswith("BEARER")
+    assert len(st["auth0_calls"]) == 1
+
+
+def test_auth0_keepalive_due_when_jwt_near_expiry(settings):
+    now = {"t": 0.0}
+    store = TokenStore(mode="auth0", path=settings.token_path)
+    store.auth0 = Auth0Tokens(refresh_token="RT0", access_token="jwt", expires_at=1000.0)
+    store.apigee = ApigeeTokens(access_token="B", expires_at=1e9)
+    auth = AuthManager(settings, store, make_client(lambda r: httpx.Response(500)), clock=lambda: now["t"])
+    assert auth.keepalive_due() is False
+    now["t"] = 800.0  # within AUTH0_MARGIN (300) of 1000
+    assert auth.keepalive_due() is True

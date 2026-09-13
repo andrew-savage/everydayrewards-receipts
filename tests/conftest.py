@@ -21,6 +21,18 @@ def settings(tmp_path) -> Settings:
     )
 
 
+@pytest.fixture
+def settings_graphql(tmp_path) -> Settings:
+    return Settings.from_env(
+        {
+            "EDR_OUTPUT_DIR": str(tmp_path / "receipts"),
+            "EDR_DATA_DIR": str(tmp_path / "data"),
+            "EDR_POLL_INTERVAL": "1h",
+            "EDR_FEED_MODE": "graphql",
+        }
+    )
+
+
 class Recorder:
     """Collects requests made through a MockTransport."""
 

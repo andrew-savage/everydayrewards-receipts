@@ -58,6 +58,8 @@ def infer_date_from_feed(display_date: str | None, group_title: str | None, toda
 
 def resolve_transaction_date(item: ActivityItem, receipt: ReceiptDetails | None, today: date | None = None) -> date | None:
     today = today or date.today()
+    if item.rest_datetime is not None:
+        return item.rest_datetime.date()
     if receipt is not None:
         dt = receipt.transaction_datetime()
         if dt:

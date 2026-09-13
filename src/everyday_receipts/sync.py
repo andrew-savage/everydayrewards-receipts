@@ -93,7 +93,7 @@ class SyncService:
         stats = SyncStats()
         started = time.time()
         try:
-            for items in self.client.iter_activity_pages():
+            for items in self.client.iter_receipt_pages():
                 stats.pages += 1
                 stats.items += len(items)
                 receipt_items = [item for item in items if item.has_receipt]

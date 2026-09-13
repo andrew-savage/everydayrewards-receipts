@@ -18,6 +18,8 @@ from .auth import (
     AuthManager,
     ReloginRequired,
     TokenStore,
+    looks_like_auth0_token,
+    parse_pasted_json,
     parse_redirect,
     wait_for_callback,
 )
@@ -59,6 +61,9 @@ class App:
         if settings.static_access_token:
             log.warning("EDR_ACCESS_TOKEN is set; using it as a static bearer (testing only, expires in ~30 min)")
             self.auth.use_static_token(settings.static_access_token)
+        elif self.store.mode == "none" and settings.app_token_json:
+            log.info("importing app token from EDR_APP_TOKEN_JSON")
+            self.auth.import_auth0_response(parse_pasted_json(settings.app_token_json))
         elif self.store.mode == "none" and settings.auth_status_json:
             log.info("importing session from EDR_AUTH_STATUS_JSON")
             self.auth.import_auth_status(settings.auth_status_json)
@@ -81,21 +86,24 @@ class App:
 
     def verify_session(self) -> int:
         """Fetch the first feed page and return the number of receipts on it."""
-        first_page = next(self.client.iter_activity_pages(), [])
+        first_page = next(self.client.iter_receipt_pages(), [])
         return sum(1 for item in first_page if item.has_receipt)
 
     def _print_session_summary(self, receipts: int | None = None) -> None:
         info = self.auth.describe()
         print(f"  API bearer valid for : {_fmt_seconds(info.get('api_bearer_expires_in_s'))} (renewed automatically)")
-        if info.get("api_refresh_token"):
+        if info.get("mode") == "auth0" and info.get("app_refresh_token"):
+            print("  App token            : yes (long-lived Auth0 session) - suitable for unattended use")
+            print(f"  Auth0 token valid for: {_fmt_seconds(info.get('auth0_jwt_expires_in_s'))}")
+        elif info.get("api_refresh_token"):
             print(f"  Refresh token        : yes, valid for {_fmt_seconds(info.get('api_refresh_expires_in_s'))}")
             lifetime = info.get("api_refresh_lifetime_s")
             if lifetime:
                 print(f"  Session keepalive    : renewed every ~{_fmt_seconds(int(lifetime // 2))} while the service runs")
                 if lifetime < 86400:
-                    print(f"  NOTE: if the container is stopped for more than {_fmt_seconds(int(lifetime))}, run import-session again")
-        else:
-            print("  Refresh token        : NO - unattended renewal will not work")
+                    print(f"  NOTE: web session (backfill only); import an app token for unattended use")
+        elif info.get("mode") not in ("static", "none"):
+            print("  Refresh token        : NO - web session (backfill only), import an app token for unattended use")
         if info.get("refresh_body_key"):
             print(f"  Refresh body key     : {info['refresh_body_key']}")
         if receipts is not None:
@@ -180,6 +188,36 @@ class App:
         print("Next: run `everyday-receipts refresh` once to confirm unattended renewal works.")
         return 0
 
+    def cmd_import_app_token(self, args: argparse.Namespace) -> int:
+        try:
+            if args.refresh_token:
+                self.auth.import_app_token(refresh_token=args.refresh_token, access_token=args.access_token)
+            else:
+                if args.file:
+                    text = Path(args.file).read_text(encoding="utf-8")
+                else:
+                    print("Capture the Everyday Rewards APP login with a proxy (e.g. HTTP Toolkit) and find the")
+                    print("request to auth.everyday.com.au/oauth/token. Paste its JSON RESPONSE body here")
+                    print("(the object with access_token and refresh_token), then press Enter:")
+                    try:
+                        text = input("> ")
+                    except EOFError:
+                        print("error: no input received", file=sys.stderr)
+                        return 2
+                data = parse_pasted_json(text)
+                if not looks_like_auth0_token(data):
+                    print("error: that does not look like an Auth0 token response (needs refresh_token + access_token)", file=sys.stderr)
+                    return 2
+                self.auth.import_auth0_response(data)
+            receipts = self.verify_session()
+        except (AuthError, ApiError) as exc:
+            print(f"import failed: {exc}", file=sys.stderr)
+            return 1
+        self._set_needs_login(None)
+        print("App token imported.")
+        self._print_session_summary(receipts)
+        return 0
+
     def cmd_import_session(self, args: argparse.Namespace) -> int:
         if args.refresh_token:
             try:
@@ -210,7 +248,12 @@ class App:
                 print("error: no input received", file=sys.stderr)
                 return 2
         try:
-            self.auth.import_auth_status(text)
+            data = parse_pasted_json(text)
+            if looks_like_auth0_token(data):
+                log.info("detected an Auth0 app token; importing it as a long-lived session")
+                self.auth.import_auth0_response(data)
+            else:
+                self.auth.import_auth_status(text)
             receipts = self.verify_session()
         except (AuthError, ApiError) as exc:
             print(f"import failed: {exc}", file=sys.stderr)
@@ -218,7 +261,6 @@ class App:
         self._set_needs_login(None)
         print("Session imported.")
         self._print_session_summary(receipts)
-        print("Next: run `everyday-receipts refresh` once to confirm unattended renewal works.")
         return 0
 
     def cmd_refresh(self, args: argparse.Namespace) -> int:
@@ -341,11 +383,16 @@ def build_parser() -> argparse.ArgumentParser:
     login.add_argument("--timeout", type=int, default=600, help="seconds to wait when using --listen")
     login.add_argument("--ignore-state", action="store_true", help="skip the OAuth state check")
 
-    imp = sub.add_parser("import-session", help="import the browser's authStatusData JSON (easiest)")
+    app_token = sub.add_parser("import-app-token", help="import the mobile app's Auth0 token (recommended, unattended)")
+    app_token.add_argument("--file", help="read the Auth0 token JSON from a file instead of stdin")
+    app_token.add_argument("--refresh-token", help="the app's Auth0 refresh token, if you have only that")
+    app_token.add_argument("--access-token", help="the app's Auth0 access token (JWT), optional")
+
+    imp = sub.add_parser("import-session", help="import a web session for a one-off backfill (cannot refresh)")
     imp.add_argument("--file", help="read the JSON from a file instead of stdin")
-    imp.add_argument("--refresh-token", help="import a refresh token directly (e.g. captured from the mobile app)")
+    imp.add_argument("--refresh-token", help="import a refresh token directly")
     imp.add_argument("--access-token", help="the matching bearer token (optional; minted from the refresh token if omitted)")
-    imp.add_argument("--refresh-lifetime", help="seconds the refresh token is valid (e.g. 38879999 for a mobile token)")
+    imp.add_argument("--refresh-lifetime", help="seconds the refresh token is valid")
 
     sub.add_parser("refresh", help="force a token refresh now and report the result")
     sub.add_parser("once", help="sync once and exit")

@@ -103,7 +103,8 @@ def test_graphql_errors_without_data_raise(settings):
         list(client.iter_activity_pages())
 
 
-def test_receipt_details_parsing(settings):
+def test_receipt_details_parsing(settings_graphql):
+    settings = settings_graphql
     rec = Recorder()
     client, _ = _client(settings, lambda r: httpx.Response(200, json=activity_details()), rec)
     item = ActivityItem.from_graphql(feed_item(), "This Month")
@@ -117,7 +118,8 @@ def test_receipt_details_parsing(settings):
     assert details.sections["ReceiptDetailsItems"][0]["items"][0]["description"] == "Milk 2L"
 
 
-def test_receipt_details_schema_fallback(settings):
+def test_receipt_details_schema_fallback(settings_graphql):
+    settings = settings_graphql
     rec = Recorder()
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -212,3 +214,69 @@ def test_real_auth_manager_headers_are_used(settings):
     client = EverydayRewardsClient(settings, AuthManager(settings, store, http), http)
     list(client.iter_activity_pages())
     assert seen == {"auth": "Bearer STATIC", "cid": settings.rewards_client_id, "ua": settings.user_agent}
+
+
+# --------------------------------------------------------------------------- REST feed
+
+REST_ITEM = {
+    "basketKey": "20260913161252070011703197",
+    "storeName": "3197 Ivanhoe",
+    "banner": "SO1005",
+    "storeNo": "3197",
+    "receiptType": "instore",
+    "receiptKind": ["MainReceipt"],
+    "pointsEarned": "44",
+    "receiptDate": "2026-09-13T16:14:24+10:00",
+    "EEReferenceNumber": "S3197W070SN1170T1789279972",
+    "total": "$44.40",
+    "transactionDate": "2026-09-13 16:14:24",
+    "receiptKey": "KEY-ABC",
+    "date": "13/09/2026",
+}
+
+
+def test_rest_transaction_pages(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert "/wx/v1/rewards/member/ereceipts/transactions/list" in str(request.url)
+        assert request.headers["Authorization"] == "Bearer OLD"
+        page = int(request.url.params["page"])
+        if page == 1:
+            return httpx.Response(200, json={"data": [REST_ITEM, {**REST_ITEM, "receiptKey": ""}]})
+        if page == 2:
+            return httpx.Response(200, json={"data": [{**REST_ITEM, "receiptKey": "KEY-DEF", "storeName": "1248 Town Hall"}]})
+        return httpx.Response(200, json={"data": []})
+
+    client, _ = _client(settings, handler)
+    pages = list(client.iter_receipt_pages())
+    assert [len(p) for p in pages] == [1, 1]  # empty receiptKey filtered out; stops on empty page
+    item = pages[0][0]
+    assert item.receipt_id == "KEY-ABC"
+    assert item.origin == "Ivanhoe"  # store number stripped
+    assert item.amount == "$44.40"
+    assert item.partner == "Woolworths"
+    assert item.rest_datetime.isoformat() == "2026-09-13T16:14:24"
+    assert pages[1][0].origin == "Town Hall"
+
+
+def test_rest_feed_is_default_and_details_go_rest(settings):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if request.url.path.endswith("/transactions/details"):
+            assert json.loads(request.content) == {"receiptKey": "KEY-ABC"}
+            return httpx.Response(200, json={"data": {"receiptDetails": {"download": {"url": "https://x/r.pdf", "filename": "r.pdf"}, "details": [{"__typename": "ReceiptDetailsTotal", "total": "$44.40"}]}}})
+        raise AssertionError("unexpected " + str(request.url))
+
+    client, _ = _client(settings, handler)
+    item = ActivityItem.from_rest_list(REST_ITEM)
+    details = client.get_receipt_details(item)
+    assert details.download_url == "https://x/r.pdf"
+    assert all("graphql" not in c for c in calls)  # never touches GraphQL in rest mode
+
+
+def test_rest_list_non_list_is_error(settings):
+    client, _ = _client(settings, lambda r: httpx.Response(200, json={"data": {"oops": True}}))
+    with pytest.raises(ApiError):
+        list(client.iter_receipt_pages())

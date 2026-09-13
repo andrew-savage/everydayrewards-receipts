@@ -1,13 +1,17 @@
 """Authentication against Everyday Rewards.
 
-The website logs in through Auth0 but never talks to Auth0's token endpoint itself:
-its backend hands out the Auth0 login URL (``/wx/v2/security/login/url``) and later
-swaps the returned code for API tokens (``/wx/v2/security/token``). We drive exactly
-that flow, keep the resulting refresh token, and renew the short-lived bearer with
-``/wx/v2/security/refreshToken``.
+The reliable, unattended path uses the mobile app's Auth0 session (mode ``auth0``):
 
-Alternatively the browser's stored ``authStatusData`` (bearer + refresh token) can be
-imported; it is renewed the same way.
+* The Everyday Rewards app is a standard Auth0 native client. Its refresh token is
+  long-lived and renews an Auth0 access token (a JWT) at ``auth.everyday.com.au/oauth/token``.
+* That JWT is swapped for a short-lived API bearer at the ``token-exchange`` endpoint the
+  website uses, and the bearer drives the receipt endpoints on ``api.everyday.com.au``.
+
+Two legacy bootstraps remain, useful for a one-off backfill but NOT for unattended use
+because the web session cannot be refreshed:
+
+* ``login`` - the website's backend-mediated Auth0 code flow.
+* ``import-session`` - the browser's stored ``authStatusData`` bearer + refresh token.
 """
 
 from __future__ import annotations
@@ -42,23 +46,35 @@ class AuthError(Exception):
 
 
 class ReloginRequired(AuthError):
-    """Stored credentials cannot be refreshed any more; a person must log in again."""
+    """Stored credentials cannot be refreshed any more; a person must supply a new session."""
 
 
 @dataclass
 class ApigeeTokens:
+    """A short-lived API bearer (and, for the legacy web session, its refresh token)."""
+
     access_token: str
     expires_at: float
     refresh_token: str | None = None
     refresh_expires_at: float | None = None
-    refresh_lifetime: float | None = None  # seconds the refresh token was valid for when issued
+    refresh_lifetime: float | None = None
+
+
+@dataclass
+class Auth0Tokens:
+    """The mobile app's Auth0 session: a long-lived refresh token and the current JWT."""
+
+    refresh_token: str
+    access_token: str = ""  # the Auth0 JWT (audience = woolworthsrewards auth)
+    expires_at: float = 0.0
 
 
 @dataclass
 class TokenStore:
-    mode: str = "none"  # none | apigee | static
+    mode: str = "none"  # none | auth0 | apigee | static
     apigee: ApigeeTokens | None = None
-    refresh_body_key: str | None = None  # JSON key the refresh endpoint accepted last time
+    auth0: Auth0Tokens | None = None
+    refresh_body_key: str | None = None  # JSON key the (legacy) refresh endpoint accepted
     updated_at: float = 0.0
     path: Path | None = field(default=None, repr=False, compare=False)
 
@@ -66,6 +82,7 @@ class TokenStore:
         return {
             "mode": self.mode,
             "apigee": vars(self.apigee) if self.apigee else None,
+            "auth0": vars(self.auth0) if self.auth0 else None,
             "refresh_body_key": self.refresh_body_key,
             "updated_at": self.updated_at,
         }
@@ -73,12 +90,14 @@ class TokenStore:
     @classmethod
     def from_dict(cls, data: dict[str, Any], path: Path | None = None) -> "TokenStore":
         apigee = data.get("apigee")
+        auth0 = data.get("auth0")
         mode = data.get("mode", "none")
-        if mode not in ("none", "apigee", "static"):
-            mode = "apigee" if apigee else "none"
+        if mode not in ("none", "auth0", "apigee", "static"):
+            mode = "auth0" if auth0 else ("apigee" if apigee else "none")
         return cls(
             mode=mode,
             apigee=ApigeeTokens(**apigee) if apigee else None,
+            auth0=Auth0Tokens(**auth0) if auth0 else None,
             refresh_body_key=data.get("refresh_body_key"),
             updated_at=float(data.get("updated_at") or 0.0),
             path=path,
@@ -107,22 +126,22 @@ class TokenStore:
     def clear(self) -> None:
         self.mode = "none"
         self.apigee = None
+        self.auth0 = None
         self.save()
 
 
 @dataclass
 class LoginAttempt:
-    url: str  # Auth0 authorize URL to open in a browser
-    state: str  # state we generated and sent to the backend
+    url: str
+    state: str
     redirect_uri: str
-    auth0_state: str | None  # state the backend put into the Auth0 URL (echoed back on the callback)
+    auth0_state: str | None
 
 
 # --------------------------------------------------------------------------- helpers
 
 
 def make_state() -> str:
-    """State in the same shape the website generates (base64 JSON with a nonce)."""
     payload = {"redirectUri": WEB_ORIGIN + "/", "nonce": str(secrets.randbelow(1000))}
     return base64.b64encode(json.dumps(payload).encode()).decode()
 
@@ -131,8 +150,23 @@ _ACCESS_KEYS = ("bearer", "access_token", "accessToken")
 _REFRESH_KEYS = ("refresh", "refresh_token", "refreshToken")
 
 
+def _looks_like_jwt(value: Any) -> bool:
+    return isinstance(value, str) and value.count(".") == 2 and len(value) > 60
+
+
+def _decode_jwt_exp(jwt: str) -> float | None:
+    """Return the 'exp' claim of a JWT, or None if it can't be read."""
+    try:
+        payload = jwt.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        exp = claims.get("exp")
+        return float(exp) if exp is not None else None
+    except Exception:
+        return None
+
+
 def _find_token_dict(obj: Any) -> dict[str, Any] | None:
-    """Depth-first search for the dict that carries a bearer/access token."""
     if isinstance(obj, dict):
         if any(obj.get(k) for k in _ACCESS_KEYS):
             return obj
@@ -148,32 +182,40 @@ def _find_token_dict(obj: Any) -> dict[str, Any] | None:
     return None
 
 
-def parse_auth_status(text: str) -> dict[str, Any]:
-    """Parse a captured session however it was rendered.
-
-    Accepts the browser's ``authStatusData`` (raw, a JSON string literal with ``\"``
-    escapes, a trailing `` = $1`` marker, or surrounding quotes) and also the nested
-    shapes a proxy capture of the mobile app produces, e.g. ``{"data":{"login":{...}}}``.
-    """
+def parse_pasted_json(text: str) -> Any:
+    """Parse JSON however a browser console or proxy rendered it (escapes, quotes, ' = $1')."""
     cleaned = text.strip()
-    cleaned = re.sub(r"\s*=\s*\$\d+\s*$", "", cleaned)  # Safari's " = $1" suffix
+    cleaned = re.sub(r"\s*=\s*\$\d+\s*$", "", cleaned)
     if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in "'\"" and not cleaned.startswith('"{'):
         cleaned = cleaned[1:-1]
-    data: Any = None
     for attempt in range(3):
         try:
             data = json.loads(cleaned)
         except ValueError:
-            if attempt == 0 and "\\\"" in cleaned:
-                cleaned = cleaned.replace("\\\"", '"')
+            if attempt == 0 and '\\"' in cleaned:
+                cleaned = cleaned.replace('\\"', '"')
                 cleaned = cleaned.strip("'\"") if not cleaned.startswith("{") else cleaned
                 continue
-            raise AuthError("that is not valid JSON; paste exactly what the console printed") from None
+            raise AuthError("that is not valid JSON; paste exactly what was printed") from None
         if isinstance(data, str):
-            cleaned = data  # double-encoded: unwrap and parse again
+            cleaned = data
             continue
-        break
-    token_dict = _find_token_dict(data)
+        return data
+    return data
+
+
+def looks_like_auth0_token(data: Any) -> bool:
+    """True for a captured Auth0 /oauth/token response (refresh token + JWT access token)."""
+    if not isinstance(data, dict):
+        return False
+    if not any(data.get(k) for k in _REFRESH_KEYS):
+        return False
+    return bool(data.get("id_token")) or _looks_like_jwt(data.get("access_token"))
+
+
+def parse_auth_status(text: str) -> dict[str, Any]:
+    """Parse a captured web session (``authStatusData`` and nested proxy shapes)."""
+    token_dict = _find_token_dict(parse_pasted_json(text))
     if token_dict is None:
         raise AuthError("no access/bearer token found in what you pasted; are you logged in?")
     return token_dict
@@ -204,11 +246,10 @@ def parse_redirect(text: str) -> tuple[str, str | None]:
 
 
 def wait_for_callback(host: str, port: int, timeout: float) -> str:
-    """Serve HTTP on host:port until a request carrying code= or error= arrives; return its path."""
     result: dict[str, str] = {}
 
     class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        def do_GET(self) -> None:  # noqa: N802
             if "code=" in self.path or "error=" in self.path:
                 result["path"] = self.path
                 body = b"<html><body><h2>Everyday Receipts: login received. You can close this tab.</h2></body></html>"
@@ -220,7 +261,7 @@ def wait_for_callback(host: str, port: int, timeout: float) -> str:
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *args: Any) -> None:  # silence default logging
+        def log_message(self, *args: Any) -> None:
             return
 
     server = HTTPServer((host, port), Handler)
@@ -263,7 +304,11 @@ def _pick(data: dict[str, Any], *keys: str) -> Any:
 def _error_text(body: dict[str, Any]) -> str:
     errors = body.get("errors")
     if isinstance(errors, list) and errors:
-        return "; ".join(f"{e.get('code', '')}: {e.get('message', '')}".strip(": ") for e in errors if isinstance(e, dict))
+        return "; ".join(
+            f"{e.get('code', '')}: {e.get('message', '')}".strip(": ") for e in errors if isinstance(e, dict)
+        )
+    if body.get("error"):
+        return f"{body.get('error')}: {body.get('error_description', '')}".strip(": ")
     return json.dumps(body)[:300]
 
 
@@ -271,7 +316,8 @@ def _error_text(body: dict[str, Any]) -> str:
 
 
 class AuthManager:
-    REFRESH_MARGIN = 120  # seconds before expiry at which we refresh
+    REFRESH_MARGIN = 120  # renew a bearer this many seconds before it expires
+    AUTH0_MARGIN = 300  # renew the Auth0 JWT this many seconds before it expires
 
     def __init__(
         self,
@@ -302,31 +348,231 @@ class AuthManager:
     # -- bearer -----------------------------------------------------------------
 
     def get_bearer(self, force_refresh: bool = False) -> str:
-        """Return an API bearer token, refreshing it first if it is (nearly) expired."""
         with self._lock:
             tokens = self.store.apigee
-            if (
-                not force_refresh
-                and tokens
-                and tokens.expires_at - self.clock() > self.REFRESH_MARGIN
-            ):
+            if not force_refresh and tokens and tokens.expires_at - self.clock() > self.REFRESH_MARGIN:
                 return tokens.access_token
             mode = self.store.mode
             if mode == "static":
                 if force_refresh or not tokens:
-                    raise ReloginRequired("the static EDR_ACCESS_TOKEN was rejected or has expired; supply a new one")
+                    raise ReloginRequired("the static EDR_ACCESS_TOKEN was rejected or expired; supply a new one")
                 return tokens.access_token
-            if mode == "apigee":
-                self._refresh()
+            if mode == "auth0":
+                self._mint_bearer_from_auth0(force_refresh=force_refresh)
+            elif mode == "apigee":
+                self._refresh_apigee()
             else:
-                raise ReloginRequired("no credentials stored; run `everyday-receipts login` or `import-session` first")
+                raise ReloginRequired("no credentials stored; run `everyday-receipts import-app-token` first")
             assert self.store.apigee is not None
             return self.store.apigee.access_token
 
-    # -- login ------------------------------------------------------------------
+    # -- imports ----------------------------------------------------------------
+
+    def import_app_token(self, *, refresh_token: str, access_token: str | None = None) -> None:
+        """Store the mobile app's Auth0 session and mint the first API bearer."""
+        now = self.clock()
+        expires_at = 0.0
+        if access_token:
+            exp = _decode_jwt_exp(access_token)
+            expires_at = exp if exp else now + 3600
+        with self._lock:
+            self.store.mode = "auth0"
+            self.store.apigee = None
+            self.store.auth0 = Auth0Tokens(
+                refresh_token=refresh_token,
+                access_token=access_token or "",
+                expires_at=expires_at,
+            )
+            self.store.save()
+            self._mint_bearer_from_auth0(force_refresh=not access_token)
+
+    def import_auth0_response(self, data: dict[str, Any]) -> None:
+        """Store a captured Auth0 /oauth/token response."""
+        refresh = _pick(data, *_REFRESH_KEYS)
+        if not refresh:
+            raise AuthError("no refresh_token in the captured Auth0 response")
+        self.import_app_token(refresh_token=str(refresh), access_token=data.get("access_token"))
+
+    def import_auth_status(self, text: str) -> None:
+        """Import the web app's ``authStatusData`` (backfill only; cannot refresh)."""
+        data = parse_auth_status(text)
+        with self._lock:
+            tokens = self._store_apigee_from_response(data, source="import")
+        self._warn_about_lifetime(tokens)
+
+    def import_tokens(self, *, refresh_token: str, access_token: str | None, refresh_lifetime: float | None = None) -> None:
+        """Legacy: store a directly-supplied apigee refresh token."""
+        now = self.clock()
+        with self._lock:
+            self.store.mode = "apigee"
+            self.store.auth0 = None
+            self.store.apigee = ApigeeTokens(
+                access_token=access_token or "",
+                expires_at=now if not access_token else now + 3300,
+                refresh_token=refresh_token,
+                refresh_expires_at=(now + refresh_lifetime) if refresh_lifetime else None,
+                refresh_lifetime=refresh_lifetime,
+            )
+            self.store.save()
+            if not access_token:
+                self._refresh_apigee()
+            self._warn_about_lifetime(self.store.apigee)
+
+    def use_static_token(self, token: str) -> None:
+        with self._lock:
+            self.store.mode = "static"
+            self.store.auth0 = None
+            self.store.apigee = ApigeeTokens(access_token=token, expires_at=self.clock() + 1800)
+
+    def _warn_about_lifetime(self, tokens: ApigeeTokens) -> None:
+        if not tokens.refresh_token:
+            log.warning(
+                "no refresh token in this session; the bearer will stop working in about %d minutes. "
+                "This is a web session (backfill only) - for unattended use import an app token.",
+                int((tokens.expires_at - self.clock()) // 60),
+            )
+        elif tokens.refresh_lifetime and tokens.refresh_lifetime < 6 * 3600:
+            log.warning(
+                "this refresh token lasts only ~%d minutes (a web session, backfill only). For unattended "
+                "use run `import-app-token` with a mobile-app token; see the README.",
+                int(tokens.refresh_lifetime // 60),
+            )
+
+    # -- keepalive --------------------------------------------------------------
+
+    def keepalive_due(self, now: float | None = None) -> bool:
+        now = self.clock() if now is None else now
+        tokens = self.store.apigee
+        if self.store.mode == "auth0":
+            a0 = self.store.auth0
+            if a0 is None:
+                return False
+            if a0.expires_at and a0.expires_at - now <= self.AUTH0_MARGIN:
+                return True
+            return bool(tokens and tokens.expires_at - now <= self.REFRESH_MARGIN)
+        if self.store.mode != "apigee" or tokens is None or not tokens.refresh_token:
+            return False
+        if tokens.expires_at - now <= self.REFRESH_MARGIN:
+            return True
+        if tokens.refresh_expires_at is None:
+            return False
+        threshold = max(300.0, (tokens.refresh_lifetime or 0.0) / 2)
+        return tokens.refresh_expires_at - now <= threshold
+
+    def keepalive(self) -> bool:
+        with self._lock:
+            if not self.keepalive_due():
+                return False
+            self.get_bearer(force_refresh=True)
+            return True
+
+    # -- describe ---------------------------------------------------------------
+
+    def describe(self) -> dict[str, Any]:
+        now = self.clock()
+        info: dict[str, Any] = {"mode": self.store.mode}
+        if self.store.apigee:
+            info["api_bearer_expires_in_s"] = int(self.store.apigee.expires_at - now)
+        if self.store.mode == "auth0" and self.store.auth0:
+            info["app_refresh_token"] = True
+            info["auth0_jwt_expires_in_s"] = int(self.store.auth0.expires_at - now) if self.store.auth0.expires_at else None
+        elif self.store.apigee:
+            info["api_refresh_token"] = bool(self.store.apigee.refresh_token)
+            if self.store.apigee.refresh_expires_at:
+                info["api_refresh_expires_in_s"] = int(self.store.apigee.refresh_expires_at - now)
+            if self.store.apigee.refresh_lifetime:
+                info["api_refresh_lifetime_s"] = int(self.store.apigee.refresh_lifetime)
+        if self.store.refresh_body_key:
+            info["refresh_body_key"] = self.store.refresh_body_key
+        return info
+
+    # -- auth0 flow -------------------------------------------------------------
+
+    def _mint_bearer_from_auth0(self, force_refresh: bool) -> None:
+        a0 = self.store.auth0
+        if a0 is None:
+            raise ReloginRequired("no app session stored; run `everyday-receipts import-app-token`")
+        now = self.clock()
+        need_jwt = force_refresh or not a0.access_token or (a0.expires_at and a0.expires_at - now <= self.AUTH0_MARGIN)
+        if need_jwt:
+            self._auth0_refresh()
+            a0 = self.store.auth0
+            assert a0 is not None
+        try:
+            self._exchange_auth0_jwt(a0.access_token)
+        except _ExchangeUnauthorized:
+            # The JWT was rejected; force a fresh one and try once more.
+            log.info("token exchange rejected the JWT; refreshing the Auth0 session and retrying")
+            self._auth0_refresh()
+            a0 = self.store.auth0
+            assert a0 is not None
+            self._exchange_auth0_jwt(a0.access_token)
+
+    def _auth0_refresh(self) -> None:
+        a0 = self.store.auth0
+        assert a0 is not None
+        url = f"{self.settings.auth0_domain}/oauth/token"
+        body = {
+            "grant_type": "refresh_token",
+            "client_id": self.settings.auth0_app_client_id,
+            "refresh_token": a0.refresh_token,
+        }
+        log.info("refreshing the Auth0 session via %s", url)
+        try:
+            resp = self.http.post(
+                url,
+                json=body,
+                headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": self.settings.user_agent},
+                timeout=REFRESH_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            raise AuthError(f"could not reach Auth0: {exc}") from exc
+        data = _json_or_error(resp)
+        if resp.status_code in (401, 403) or data.get("error") in ("invalid_grant", "unauthorized_client", "access_denied"):
+            raise ReloginRequired(f"Auth0 refused the app refresh token ({_error_text(data)}); capture a new app token")
+        if resp.status_code != 200 or not data.get("access_token"):
+            raise AuthError(f"Auth0 refresh failed ({resp.status_code}): {_error_text(data)}")
+        now = self.clock()
+        exp = _decode_jwt_exp(data["access_token"]) or (now + int(data.get("expires_in") or 3600))
+        # Auth0 rotates the refresh token when rotation is enabled; keep the new one, else the old.
+        new_refresh = _pick(data, *_REFRESH_KEYS) or a0.refresh_token
+        self.store.auth0 = Auth0Tokens(
+            refresh_token=str(new_refresh),
+            access_token=str(data["access_token"]),
+            expires_at=exp,
+        )
+        self.store.save()  # persist a rotated refresh token immediately (single-use)
+
+    def _exchange_auth0_jwt(self, jwt: str) -> None:
+        if not jwt:
+            raise AuthError("no Auth0 JWT to exchange")
+        url = f"{self.settings.api_base}/wx/v1/rewardspartner/secure/token-exchange"
+        log.info("exchanging the Auth0 JWT for an API bearer")
+        try:
+            resp = self.http.post(
+                url,
+                json={"access_token": jwt},
+                headers=self.api_headers(self.settings.partner_client_id),
+                timeout=REFRESH_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            raise AuthError(f"could not reach the token-exchange endpoint: {exc}") from exc
+        data = _json_or_error(resp)
+        if resp.status_code in (401, 403):
+            raise _ExchangeUnauthorized(_error_text(data))
+        if resp.status_code not in (200, 201):
+            raise AuthError(f"token exchange failed ({resp.status_code}): {_error_text(data)}")
+        payload = _unwrap(data)
+        access = _pick(payload, "accessToken", "access_token", "bearer")
+        ttl = _pick(payload, "accessTokenExpiresIn", "expires_in", "bearerExpiredInSeconds")
+        if not access:
+            raise AuthError(f"token exchange returned no bearer: {json.dumps(data)[:300]}")
+        self.store.apigee = ApigeeTokens(access_token=str(access), expires_at=self.clock() + int(ttl or 1200))
+        self.store.save()
+
+    # -- web login flow (backfill only) -----------------------------------------
 
     def begin_login(self, redirect_uri: str) -> LoginAttempt:
-        """Ask the backend for the Auth0 login URL, as the website does."""
         state = make_state()
         params = {"state": state, "redirectUri": redirect_uri, "newSignup": "true"}
         url = f"{self.settings.security_base}/wx/v2/security/login/url?{urlencode(params)}"
@@ -344,13 +590,8 @@ class AuthManager:
         return LoginAttempt(url=login_url, state=state, redirect_uri=redirect_uri, auth0_state=auth0_state)
 
     def check_login_url(self, url: str) -> str | None:
-        """Return Auth0's up-front rejection (e.g. callback URL mismatch), or None if the URL looks usable."""
         try:
-            resp = self.http.get(
-                url,
-                headers={"Accept": "text/html", "User-Agent": self.settings.user_agent},
-                follow_redirects=False,
-            )
+            resp = self.http.get(url, headers={"Accept": "text/html", "User-Agent": self.settings.user_agent}, follow_redirects=False)
         except httpx.HTTPError as exc:
             log.warning("could not pre-check the login URL (%s); continuing anyway", exc)
             return None
@@ -363,12 +604,7 @@ class AuthManager:
         return None
 
     def complete_login(self, code: str, callback_state: str | None, attempt: LoginAttempt) -> ApigeeTokens:
-        """Swap the code from the callback URL for API tokens via the backend."""
-        payload = {
-            "code": code,
-            "state": callback_state or attempt.auth0_state or attempt.state,
-            "redirectUri": attempt.redirect_uri,
-        }
+        payload = {"code": code, "state": callback_state or attempt.auth0_state or attempt.state, "redirectUri": attempt.redirect_uri}
         url = f"{self.settings.security_base}/wx/v2/security/token"
         try:
             resp = self.http.post(url, json=payload, headers=self.api_headers(self.settings.rewards_client_id))
@@ -378,99 +614,14 @@ class AuthManager:
         if resp.status_code != 200:
             raise AuthError(f"Everyday Rewards rejected the login code ({resp.status_code}): {_error_text(body)}")
         data = _unwrap(body)
-        returned_state = data.get("state")
-        if returned_state and returned_state != attempt.state:
-            log.warning("token endpoint returned a different state than we generated; continuing")
         if data.get("passwordResetRequired"):
             log.warning("Everyday Rewards says this account must reset its password; receipts may not load until that is done")
         with self._lock:
-            return self._store_tokens(data, source="login")
+            return self._store_apigee_from_response(data, source="login")
 
-    def import_auth_status(self, text: str) -> None:
-        """Import the web app's localStorage ``authStatusData`` JSON blob."""
-        data = parse_auth_status(text)
-        with self._lock:
-            tokens = self._store_tokens(data, source="import")
-        self._warn_about_lifetime(tokens)
+    # -- legacy apigee refresh (rarely works) -----------------------------------
 
-    def import_tokens(self, *, refresh_token: str, access_token: str | None, refresh_lifetime: float | None = None) -> None:
-        """Store a session from a directly-supplied refresh token (e.g. captured from the app)."""
-        now = self.clock()
-        with self._lock:
-            self.store.mode = "apigee"
-            self.store.apigee = ApigeeTokens(
-                access_token=access_token or "",
-                expires_at=now if not access_token else now + 3300,
-                refresh_token=refresh_token,
-                refresh_expires_at=(now + refresh_lifetime) if refresh_lifetime else None,
-                refresh_lifetime=refresh_lifetime,
-            )
-            self.store.save()
-            if not access_token:
-                self._refresh()  # mint a bearer straight away
-            self._warn_about_lifetime(self.store.apigee)
-
-    def _warn_about_lifetime(self, tokens: ApigeeTokens) -> None:
-        if not tokens.refresh_token:
-            log.warning(
-                "no refresh token in this session; the bearer will stop working in about %d minutes",
-                int((tokens.expires_at - self.clock()) // 60),
-            )
-        elif tokens.refresh_lifetime and tokens.refresh_lifetime < 6 * 3600:
-            log.warning(
-                "this refresh token lasts only ~%d minutes (a web session). For unattended use, "
-                "import a mobile-app token instead; see the README.",
-                int(tokens.refresh_lifetime // 60),
-            )
-
-    def keepalive_due(self, now: float | None = None) -> bool:
-        """True when the refresh token should be renewed to keep the session alive.
-
-        Refresh tokens from the web login are short-lived (about two hours), so a service
-        that only syncs every few hours must renew them in between. We renew once less than
-        half the lifetime (or five minutes) remains, or when the bearer itself has expired.
-        """
-        tokens = self.store.apigee
-        if self.store.mode != "apigee" or tokens is None or not tokens.refresh_token:
-            return False
-        now = self.clock() if now is None else now
-        if tokens.expires_at - now <= self.REFRESH_MARGIN:
-            return True
-        if tokens.refresh_expires_at is None:
-            return False
-        threshold = max(300.0, (tokens.refresh_lifetime or 0.0) / 2)
-        return tokens.refresh_expires_at - now <= threshold
-
-    def keepalive(self) -> bool:
-        """Renew the session if :meth:`keepalive_due`; returns True when a refresh happened."""
-        with self._lock:
-            if not self.keepalive_due():
-                return False
-            self._refresh()
-            return True
-
-    def use_static_token(self, token: str) -> None:
-        with self._lock:
-            self.store.mode = "static"
-            self.store.apigee = ApigeeTokens(access_token=token, expires_at=self.clock() + 1800)
-
-    def describe(self) -> dict[str, Any]:
-        now = self.clock()
-        info: dict[str, Any] = {"mode": self.store.mode}
-        if self.store.apigee:
-            info["api_bearer_expires_in_s"] = int(self.store.apigee.expires_at - now)
-            info["api_refresh_token"] = bool(self.store.apigee.refresh_token)
-            if self.store.apigee.refresh_expires_at:
-                info["api_refresh_expires_in_s"] = int(self.store.apigee.refresh_expires_at - now)
-            if self.store.apigee.refresh_lifetime:
-                info["api_refresh_lifetime_s"] = int(self.store.apigee.refresh_lifetime)
-        if self.store.refresh_body_key:
-            info["refresh_body_key"] = self.store.refresh_body_key
-        return info
-
-    # -- internals --------------------------------------------------------------
-
-    def _store_tokens(
+    def _store_apigee_from_response(
         self,
         data: dict[str, Any],
         *,
@@ -498,14 +649,13 @@ class AuthManager:
         self.store.save()
         return tokens
 
-    def _refresh(self) -> None:
+    def _refresh_apigee(self) -> None:
         tokens = self.store.apigee
         if tokens is None or not tokens.refresh_token:
-            raise ReloginRequired("the stored session has no refresh token; run `everyday-receipts login` or `import-session`")
+            raise ReloginRequired("the stored session has no refresh token; import an app token")
         now = self.clock()
         if tokens.refresh_expires_at and tokens.refresh_expires_at <= now:
-            raise ReloginRequired("the refresh token has expired; run `everyday-receipts login` again")
-
+            raise ReloginRequired("the refresh token has expired; import a new app token")
         keys: list[str] = []
         for key in (self.store.refresh_body_key, self.settings.apigee_refresh_body_key, *REFRESH_BODY_KEYS):
             if key and key not in keys:
@@ -538,7 +688,7 @@ class AuthManager:
             if key != self.store.refresh_body_key:
                 log.info("refresh endpoint accepted body key %r; remembering it", key)
                 self.store.refresh_body_key = key
-            self._store_tokens(
+            self._store_apigee_from_response(
                 data,
                 source="refresh",
                 fallback_refresh=tokens.refresh_token,
@@ -547,3 +697,7 @@ class AuthManager:
             )
             return
         raise last_error or AuthError("refresh failed")
+
+
+class _ExchangeUnauthorized(AuthError):
+    """The token-exchange endpoint rejected the Auth0 JWT (retry with a fresh JWT)."""

@@ -22,7 +22,7 @@ class FakeClient:
         self.details_calls: list[str] = []
         self.download_calls = 0
 
-    def iter_activity_pages(self):
+    def iter_receipt_pages(self):
         for idx, page in enumerate(self.pages):
             title = "This Month" if idx == 0 else f"Month {idx}"
             yield [ActivityItem.from_graphql(raw, title) for raw in page]
