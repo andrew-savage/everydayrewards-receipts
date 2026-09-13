@@ -100,8 +100,13 @@ class ActivityItem:
         else:
             if receipt_type == "online":
                 partner = "Woolworths Online"
+        # NB: never fall back to receiptKey for identity - it is a freshly salted
+        # ciphertext that differs on every API call.
+        identity = item.get("EEReferenceNumber") or item.get("basketKey")
+        if not identity:
+            identity = "|".join(str(item.get(k) or "") for k in ("receiptDate", "storeNo", "total"))
         return cls(
-            id=str(item.get("EEReferenceNumber") or item.get("basketKey") or item.get("receiptKey") or ""),
+            id=str(identity),
             display_date=item.get("date"),
             description=f"{amount} at {store}" if amount and store else (store or item.get("date")),
             icon=None,
@@ -141,6 +146,17 @@ class ActivityItem:
     @property
     def has_receipt(self) -> bool:
         return bool(self.receipt_id)
+
+    @property
+    def stable_id(self) -> str:
+        """Identity that survives across API calls: use this for dedupe and filenames.
+
+        The REST list's ``receiptKey`` is re-encrypted with a random salt on every request,
+        so it changes each time and must never be used to decide whether a receipt is new.
+        ``id`` is the transaction reference (EEReferenceNumber / basketKey / GraphQL id),
+        which is stable.
+        """
+        return self.id or self.receipt_id or ""
 
     @property
     def details_id(self) -> str:

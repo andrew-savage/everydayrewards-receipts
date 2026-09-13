@@ -81,7 +81,9 @@ def build_filename(
     today: date | None = None,
 ) -> str:
     tx_date = resolve_transaction_date(item, receipt, today)
-    receipt_id = item.receipt_id or item.id
+    # Must be the stable id: receiptKey changes on every API call, which would give the
+    # same receipt a different filename each sync.
+    receipt_id = item.stable_id or item.receipt_id or item.id
     fields = {
         "date": tx_date.isoformat() if tx_date else "undated",
         "partner": sanitize_component(item.partner),

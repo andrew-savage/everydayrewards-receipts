@@ -161,11 +161,30 @@ docker compose logs -f                                            # what it is d
 * **Check renewal.** `docker compose run --rm everyday-receipts refresh` forces the full
   refresh chain and reports the result.
 * **Update.** `docker compose pull && docker compose up -d` picks up the latest published image.
-* **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by receipt id) or
-  delete `state.json` entirely; existing PDFs are never overwritten, so re-scans are safe.
+* **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by the stable
+  transaction reference) or delete `state.json` entirely; existing PDFs are never overwritten,
+  so re-scans are safe.
+* **Files vanishing from the consume folder is normal.** paperless-ngx removes each file once
+  it has ingested it. The service tracks what it has saved in `data/state.json`, not by
+  looking at the folder, so a removed file is never fetched or written again.
 * **Backfill.** The first run fetches everything Everyday Rewards still holds (close to three
   years in practice, several hundred receipts). Fuel and points-only activities have no
   e-receipt and are skipped.
+
+## Identity and de-duplication
+
+Receipts are tracked by their **stable transaction reference** (`EEReferenceNumber`, falling
+back to `basketKey`), which is also what the `[short_id]` in the filename is derived from.
+
+This matters: the list endpoint's `receiptKey` is re-encrypted with a random salt on every
+request (it starts `U2FsdGVkX1`, base64 for `Salted__`), so the *same* receipt has a
+different `receiptKey` every time you ask. Keying off it made every sync treat every receipt
+as new, re-download the lot and write freshly named files; with a consumer that removes files
+after ingesting them, that loops forever. A content hash of each PDF is also recorded as a
+second guard, so a receipt already saved is never filed again even if its identity changes.
+
+State written by an earlier version is migrated automatically on first run: old entries are
+matched by date, amount and store, so your back-catalogue is not fetched again.
 
 ## How the auth actually works
 

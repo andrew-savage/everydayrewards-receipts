@@ -54,7 +54,8 @@ def test_build_filename_default_template():
 def test_build_filename_custom_template_and_sanitising():
     item = ActivityItem.from_graphql(feed_item(origin='Store/With:Bad*Chars', icon="bws"), "This Month")
     name = build_filename(item, None, template="{partner} - {store} - {receipt_id}", today=date(2026, 9, 10))
-    assert name == "BWS - Store With Bad Chars - RCPT1.pdf"
+    # {receipt_id} resolves to the stable transaction id, never the salted receiptKey
+    assert name == "BWS - Store With Bad Chars - S3060W084SN2594T1667044800.pdf"
 
 
 def test_partner_names():
