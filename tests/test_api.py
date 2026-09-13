@@ -280,3 +280,27 @@ def test_rest_list_non_list_is_error(settings):
     client, _ = _client(settings, lambda r: httpx.Response(200, json={"data": {"oops": True}}))
     with pytest.raises(ApiError):
         list(client.iter_receipt_pages())
+
+
+# --------------------------------------------------------------------------- multi-line paste reader
+
+def test_read_json_block_multiline_and_single_line():
+    from everyday_receipts.cli import _read_json_block
+
+    pretty = '{\n  "access_token": "ey.J.s",\n  "refresh_token": "r",\n  "expires_in": 86400\n}'
+    lines = iter(pretty.split("\n"))
+    text = _read_json_block(read_line=lambda: next(lines))
+    import json as _json
+    assert _json.loads(text)["refresh_token"] == "r"
+
+    # A single-line authStatusData (braces are inside a quoted string) returns after one line.
+    one = '"{\\"reason\\":\\"AUTHENTICATED\\",\\"access_token\\":\\"A\\"}"'
+    called = {"n": 0}
+
+    def one_then_block():
+        called["n"] += 1
+        if called["n"] == 1:
+            return one
+        raise AssertionError("should not read a second line for a single-line paste")
+
+    assert _read_json_block(read_line=one_then_block) == one

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import httpx
 
+from typing import Callable
+
 from . import __version__
 from .api import ApiError, EverydayRewardsClient
 from .auth import (
@@ -37,6 +39,43 @@ def _setup_logging(level: str) -> None:
         stream=sys.stdout,
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _read_json_block(read_line: "Callable[[], str]" = input) -> str:
+    """Read a possibly multi-line pasted JSON object from stdin.
+
+    Pretty-printed JSON spans many lines, so a single input() call is not enough. This reads
+    lines until the top-level braces balance (ignoring braces inside strings), which is the
+    end of the object; a single-line paste (or a bare token) returns after the first line.
+    """
+    lines: list[str] = []
+    depth = 0
+    started = False
+    while True:
+        try:
+            line = read_line()
+        except EOFError:
+            break
+        lines.append(line)
+        in_str = False
+        esc = False
+        for ch in line:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = not in_str
+            elif not in_str and ch == "{":
+                depth += 1
+                started = True
+            elif not in_str and ch == "}":
+                depth -= 1
+        if started and depth <= 0:
+            break
+        if not started and line.strip():
+            break  # a single-line paste with no unquoted braces (authStatusData, bare token)
+    return "\n".join(lines)
 
 
 def _fmt_seconds(seconds: int | None) -> str:
@@ -198,10 +237,11 @@ class App:
                 else:
                     print("Capture the Everyday Rewards APP login with a proxy (e.g. HTTP Toolkit) and find the")
                     print("request to auth.everyday.com.au/oauth/token. Paste its JSON RESPONSE body here")
-                    print("(the object with access_token and refresh_token), then press Enter:")
-                    try:
-                        text = input("> ")
-                    except EOFError:
+                    print("(the whole object with access_token and refresh_token; multi-line is fine), then")
+                    print("press Enter. Tip: `import-app-token --file token.json` avoids paste issues.")
+                    print("> ", end="", flush=True)
+                    text = _read_json_block()
+                    if not text.strip():
                         print("error: no input received", file=sys.stderr)
                         return 2
                 data = parse_pasted_json(text)
@@ -242,9 +282,9 @@ class App:
             print("    localStorage.getItem('authStatusData')")
             print("Copy the value it prints (quotes, backslashes and any trailing ' = $1' are fine),")
             print("paste it here and press Enter:")
-            try:
-                text = input("> ")
-            except EOFError:
+            print("> ", end="", flush=True)
+            text = _read_json_block()
+            if not text.strip():
                 print("error: no input received", file=sys.stderr)
                 return 2
         try:
