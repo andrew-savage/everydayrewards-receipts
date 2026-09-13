@@ -31,12 +31,18 @@ If the app's refresh token is ever rejected, the health check turns unhealthy an
 ```bash
 cp .env.example .env            # edit RECEIPTS_DIR / DATA_DIR / PUID / PGID
 mkdir -p receipts data
-docker compose build
+docker compose pull             # prebuilt image from GitHub Container Registry, nothing to compile
 docker compose run --rm everyday-receipts import-app-token   # one-time, interactive (see below)
 docker compose run --rm everyday-receipts refresh            # proves unattended renewal works
 docker compose up -d
 docker compose logs -f
 ```
+
+The image is built by GitHub Actions from every commit on `main` and published as
+`ghcr.io/andrew-savage/everydayrewards-receipts:latest` for amd64 and arm64. You only need
+`docker-compose.yml`, `.env.example` and the two folders on the machine that runs it; cloning
+the repository is optional. If the package is private, first run `docker login ghcr.io` with a
+GitHub token that has the `read:packages` scope.
 
 ### Capturing the app token (one-time)
 
@@ -154,6 +160,7 @@ docker compose logs -f                                            # what it is d
   capture a fresh app token and run `import-app-token` again. Nothing else changes.
 * **Check renewal.** `docker compose run --rm everyday-receipts refresh` forces the full
   refresh chain and reports the result.
+* **Update.** `docker compose pull && docker compose up -d` picks up the latest published image.
 * **Re-download a receipt.** Delete its entry from `data/state.json` (keyed by receipt id) or
   delete `state.json` entirely; existing PDFs are never overwritten, so re-scans are safe.
 * **Backfill.** The first run fetches everything Everyday Rewards still holds (close to three
@@ -191,6 +198,11 @@ uv sync                      # creates .venv with dev deps
 uv run pytest                # unit tests (all HTTP is mocked)
 uv run everyday-receipts --help
 ```
+
+To build the image yourself, `docker build -t ghcr.io/andrew-savage/everydayrewards-receipts:latest .`
+or uncomment `build: .` in `docker-compose.yml`. CI (`.github/workflows/docker.yml`) builds and
+publishes the image on every push to `main`; pushing a tag such as `v0.2.0` also publishes
+`0.2.0` and `0.2` tags.
 
 Layout: `config.py` (env settings), `auth.py` (Auth0 refresh + token exchange, token store),
 `api.py` (REST + GraphQL client), `models.py` (list items, receipt details), `naming.py`

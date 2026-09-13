@@ -1,7 +1,9 @@
 services:
   everyday-receipts:
-    build: .
-    image: everyday-receipts:local
+    # Prebuilt for amd64 and arm64 by GitHub Actions on every push to main.
+    image: ghcr.io/andrew-savage/everydayrewards-receipts:latest
+    # To build from source instead of pulling, uncomment the next line.
+    # build: .
     container_name: everyday-receipts
     restart: unless-stopped
     # Files are created as this uid:gid; match what your NFS export / paperless expects.
