@@ -1,6 +1,6 @@
 [project]
 name = "everyday-receipts"
-version = "0.1.0"
+version = "1.0.0"
 description = "Fetch Everyday Rewards (Woolworths) e-receipts as PDFs into a folder for paperless-ngx"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -1,7 +1,8 @@
 services:
   everyday-receipts:
-    # Prebuilt for amd64 and arm64 by GitHub Actions on every push to main.
-    image: ghcr.io/andrew-savage/everydayrewards-receipts:latest
+    # Prebuilt for amd64 and arm64 and published to GitHub Container Registry.
+    # Pin a release by setting EDR_IMAGE_TAG in .env (e.g. EDR_IMAGE_TAG=1.0.0).
+    image: ghcr.io/andrew-savage/everydayrewards-receipts:${EDR_IMAGE_TAG:-latest}
     # To build from source instead of pulling, uncomment the next line.
     # build: .
     container_name: everyday-receipts

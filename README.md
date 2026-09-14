@@ -38,11 +38,35 @@ docker compose up -d
 docker compose logs -f
 ```
 
-The image is built by GitHub Actions from every commit on `main` and published as
-`ghcr.io/andrew-savage/everydayrewards-receipts:latest` for amd64 and arm64. You only need
-`docker-compose.yml`, `.env.example` and the two folders on the machine that runs it; cloning
-the repository is optional. If the package is private, first run `docker login ghcr.io` with a
-GitHub token that has the `read:packages` scope.
+### Install without cloning
+
+The image is public, so the two files below are all you need on the machine that runs it:
+
+```bash
+mkdir -p everyday-receipts && cd everyday-receipts
+BASE=https://raw.githubusercontent.com/andrew-savage/everydayrewards-receipts/main
+curl -fsSLO $BASE/docker-compose.yml
+curl -fsSL  $BASE/.env.example -o .env
+mkdir -p receipts data
+$EDITOR .env                    # set RECEIPTS_DIR / DATA_DIR / PUID / PGID / TZ
+docker compose pull
+```
+
+Then follow [Capturing the app token](#capturing-the-app-token-one-time) below.
+
+### Versions
+
+Images are published to GitHub Container Registry for amd64 and arm64:
+
+| Tag | Moves? | Use it when |
+| --- | --- | --- |
+| `latest` | yes, on every push to `main` | you want the newest build |
+| `1.0.0` (exact release) | never | you want a reproducible deployment |
+| `1.0` | yes, within that minor series | you want fixes but no breaking changes |
+
+Pin one by setting `EDR_IMAGE_TAG` in `.env`, then `docker compose pull && docker compose up -d`.
+Releases are listed at
+https://github.com/andrew-savage/everydayrewards-receipts/releases.
 
 ### Capturing the app token (one-time)
 
