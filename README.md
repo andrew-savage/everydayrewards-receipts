@@ -40,7 +40,7 @@ docker compose logs -f
 
 ### Install without cloning
 
-The image is public, so the two files below are all you need on the machine that runs it:
+The two files below are all you need on the machine that runs it:
 
 ```bash
 mkdir -p everyday-receipts && cd everyday-receipts
@@ -53,6 +53,13 @@ docker compose pull
 ```
 
 Then follow [Capturing the app token](#capturing-the-app-token-one-time) below.
+
+If `docker compose pull` is denied, the container package is still private. Package
+visibility is separate from repository visibility on GitHub, so making the repo public does
+not publish the image. Either make the package public at
+`https://github.com/users/andrew-savage/packages/container/everydayrewards-receipts/settings`
+(Danger Zone, Change package visibility), or authenticate on that machine with
+`docker login ghcr.io` using a token that has the `read:packages` scope.
 
 ### Versions
 
